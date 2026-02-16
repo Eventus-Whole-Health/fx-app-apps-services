@@ -1,0 +1,10 @@
+azure-functions==1.18.0
+azure-identity
+azure-storage-blob
+httpx
+aiohttp
+pydantic
+pydantic-settings
+opencensus-ext-azure
+pytz
+seqlog>=0.3.28

@@ -1,0 +1,64 @@
+# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
+# More GitHub Actions for Azure: https://github.com/Azure/actions
+# More info on Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
+
+name: Build and deploy Python project to Azure Function App - fx-app-apps-services
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'fx-app-apps-services/**'
+  workflow_dispatch:
+
+env:
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: "fx-app-apps-services" # Set to fx-app-apps-services directory
+  PYTHON_VERSION: "3.11" # set this to the python version to use (supports 3.6, 3.7, 3.8)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write #This is required for requesting the JWT
+      contents: read #This is required for actions/checkout
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create and start virtual environment
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/requirements.txt -t ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
+      # Optional: Add step to run tests here
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_0E7FAB054CFD45FB8413068FC0A40FEA }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_6E9FCE14AF20457491A97D24A2E8E5BF }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_4249D71BA8114E6B9BC2050ADE2A1896 }}
+
+      - name: "Deploy to Azure Functions"
+        uses: Azure/functions-action@v1
+        id: deploy-to-function
+        with:
+          app-name: "fx-app-apps-services"
+          slot-name: "Production"
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          remote-build: true
+        env:
+          SCM_DO_BUILD_DURING_DEPLOYMENT: false
+          ENABLE_ORYX_BUILD: false
