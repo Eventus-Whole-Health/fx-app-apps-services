@@ -34,7 +34,7 @@ functions/
 ├── shared/              # Reusable services (unchanged from apps_services)
 │   ├── settings.py      # Pydantic config with caching
 │   ├── sql_client.py    # SQL Executor API client
-│   ├── master_service_logger.py  # Master log tracking
+│   ├── service_logger.py  # Service log tracking
 │   ├── seq_logging.py   # Structured logging
 │   └── telemetry.py     # Application Insights
 ├── scheduler/

@@ -15,7 +15,7 @@ import httpx
 from ..shared.settings import get_settings
 from ..shared.sql_client import SQLClient
 from ..shared.telemetry import track_event, track_exception
-from ..shared.master_service_logger import MasterServiceLogger
+from ..shared.service_logger import ServiceLogger
 
 LOGGER = logging.getLogger(__name__)
 
@@ -252,7 +252,7 @@ async def check_and_handle_stuck_processing_services(sql_client: SQLClient, curr
 async def process_scheduled_services_with_overrides(
     bypass_window_check: bool = False,
     force_service_ids: list[int] = None,
-    master_logger: Optional[MasterServiceLogger] = None
+    master_logger: Optional[ServiceLogger] = None
 ) -> Dict[str, Any]:
     """Process all scheduled services that are due for execution with optional overrides."""
     settings = get_settings()
@@ -817,7 +817,7 @@ def is_sleeping_service_response(response_code: int, response_detail: str) -> bo
 async def execute_service_request(
     service: Dict[str, Any],
     current_time: datetime,
-    master_logger: Optional[MasterServiceLogger] = None
+    master_logger: Optional[ServiceLogger] = None
 ) -> tuple[bool, int, str, Optional[int]]:
     """Execute HTTP request to the service trigger URL and 202 polling.
 
@@ -958,7 +958,7 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
     LOGGER.info("Scheduler timer function started")
     
     # Initialize master service logger for this timer execution (but don't log yet)
-    master_logger = MasterServiceLogger(
+    master_logger = ServiceLogger(
         service_name="scheduler_timer",
         function_app="apps_services", 
         trigger_source="timer"
@@ -1101,7 +1101,7 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     LOGGER.info(f"   🕐 Timestamp: {datetime.now().isoformat()}")
     
     # Initialize master service logger for this HTTP execution
-    master_logger = MasterServiceLogger(
+    master_logger = ServiceLogger(
         service_name="scheduler_http_trigger", 
         function_app="apps_services",
         trigger_source="HTTP"

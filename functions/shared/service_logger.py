@@ -1,4 +1,4 @@
-"""Master Service Logger for logging to apps_master_services_log table."""
+"""ServiceLogger for logging to apps_master_services_log table."""
 from __future__ import annotations
 
 import json
@@ -15,19 +15,16 @@ from .seq_logging import sanitize_sensitive_data
 LOGGER = logging.getLogger(__name__)
 
 
-class MasterServiceLogger:
+class ServiceLogger:
     """
     Logger for the centralized apps_master_services_log table.
 
-    Follows the pattern specified in MASTER_SERVICES_LOG_README.md with lessons
-    learned from AI Scribing Services migration.
-
     Usage:
         # Root service (no parent)
-        logger = MasterServiceLogger("scheduler_timer")
+        logger = ServiceLogger("scheduler_timer")
 
         # Child service (has parent)
-        logger = MasterServiceLogger("child_service", parent_service_id=123, root_id=123)
+        logger = ServiceLogger("child_service", parent_service_id=123, root_id=123)
     """
 
     def __init__(
@@ -36,7 +33,7 @@ class MasterServiceLogger:
         *,
         parent_service_id: Optional[int] = None,
         root_id: Optional[int] = None,
-        function_app: str = "apps_services",
+        function_app: str = "fx-app-apps-services",
         trigger_source: str = "timer"
     ):
         """

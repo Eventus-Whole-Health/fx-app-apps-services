@@ -67,7 +67,7 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 |------|---------|
 | `settings.py` | Pydantic-based config with caching |
 | `sql_client.py` | SQL Executor API client (client credentials auth) |
-| `master_service_logger.py` | Logs to apps_master_services_log with workflow tracking |
+| `service_logger.py` | Logs to apps_master_services_log with workflow tracking |
 | `seq_logging.py` | Structured logging to Seq with sensitive data sanitization |
 | `telemetry.py` | Application Insights integration |
 
@@ -121,12 +121,12 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 
 ```python
 from ..shared.sql_client import SQLClient
-from ..shared.master_service_logger import MasterServiceLogger
+from ..shared.service_logger import ServiceLogger
 
 @bp.route(route="example", methods=["POST"])
 async def example_function(req: func.HttpRequest) -> func.HttpResponse:
     async with SQLClient() as sql:
-        logger = MasterServiceLogger("example_service", function_app="fx-app-apps-services")
+        logger = ServiceLogger("example_service", function_app="fx-app-apps-services")
         await logger.log_start(sql, request_data=json.dumps(request_body))
 
         # Business logic here
