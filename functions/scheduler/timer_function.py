@@ -941,7 +941,7 @@ async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any
 # Create the blueprint for scheduler functions
 bp = func.Blueprint()
 
-@bp.timer_trigger(schedule="0 0 0 0 * *", arg_name="timer", run_on_startup=False)
+@bp.timer_trigger(schedule="0 0,15,30,45 * * * *", arg_name="timer", run_on_startup=False)
 async def scheduler_timer(timer: func.TimerRequest) -> None:
     """
     Timer function that runs every 15 minutes (at 00, 15, 30, 45 minutes past the hour) to process scheduled services.
