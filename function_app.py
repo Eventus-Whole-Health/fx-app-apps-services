@@ -30,6 +30,8 @@ app = func.FunctionApp()
 # ============================================================
 from functions.scheduler.timer_function import bp as scheduler_bp
 from functions.master_services_log.status_endpoints import bp as master_services_log_bp
+from functions.trigger_function.trigger_function import bp as trigger_bp
 
 app.register_functions(scheduler_bp)
 app.register_functions(master_services_log_bp)
+app.register_functions(trigger_bp)
