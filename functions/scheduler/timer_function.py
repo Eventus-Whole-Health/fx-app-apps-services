@@ -960,7 +960,7 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
     # Initialize master service logger for this timer execution (but don't log yet)
     master_logger = ServiceLogger(
         service_name="scheduler_timer",
-        function_app="apps_services", 
+        function_app="fx-app-apps-services",
         trigger_source="timer"
     )
     
@@ -1103,7 +1103,7 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     # Initialize master service logger for this HTTP execution
     master_logger = ServiceLogger(
         service_name="scheduler_http_trigger", 
-        function_app="apps_services",
+        function_app="fx-app-apps-services",
         trigger_source="HTTP"
     )
     
