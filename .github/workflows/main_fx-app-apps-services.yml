@@ -8,12 +8,10 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'fx-app-apps-services/**'
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: "fx-app-apps-services" # Set to fx-app-apps-services directory
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: "." # Standalone repo - deploy from root
   PYTHON_VERSION: "3.11" # set this to the python version to use (supports 3.6, 3.7, 3.8)
 
 jobs:
