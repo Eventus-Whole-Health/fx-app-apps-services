@@ -109,8 +109,7 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
   - Response: `{"status": "triggered", "services_found": 3}`
 
 - **Timer trigger** - Every 15 minutes at :00, :15, :30, :45
-  - **Currently disabled** with schedule `"0 0 0 0 * *"` (impossible date - day 0 doesn't exist)
-  - Will be enabled in Phase 4 after testing
+  - Schedule: `"0 0,15,30,45 * * * *"` — **ACTIVE and running in production**
 
 ### Status Endpoints
 
@@ -140,10 +139,18 @@ async def example_function(req: func.HttpRequest) -> func.HttpResponse:
 
 All secrets stored in Key Vault (`eventus-apps`). Function app references via settings:
 
-- `SQL_EXECUTOR_CLIENT_ID`, `SQL_EXECUTOR_CLIENT_SECRET`, `SQL_EXECUTOR_TENANT_ID`
-- `SQL_EXECUTOR_URL`, `SQL_EXECUTOR_SCOPE`, `SQL_EXECUTOR_SERVER`
-- `SEQ_SERVER_URL`, `SEQ_API_KEY`
-- `APPLICATIONINSIGHTS_CONNECTION_STRING`
+- `SQL_EXECUTOR_CLIENT_ID` → KV secret `executor-client-id`
+- `SQL_EXECUTOR_CLIENT_SECRET` → KV secret `executor-client-secret`
+- `SQL_EXECUTOR_TENANT_ID` → KV secret `azure-tenant-id`
+- `SQL_EXECUTOR_URL` = `https://fx-app-data-services.azurewebsites.net/api/sql-executor`
+- `SQL_EXECUTOR_SCOPE` = `api://8b3542fd-41c7-4aec-b14d-d0ee8342e57a/.default`
+- `SQL_EXECUTOR_SERVER` = `apps`
+- `LOGIC_APP_EMAIL_URL` → Logic App webhook URL (required by settings.py even if not used by scheduler)
+- `AZURE_STORAGE_CONNECTION_STRING` → fxappsstorage connection string (required by settings.py)
+- `SEQ_SERVER_URL`, `SEQ_API_KEY` → KV secret `seq-api-key`
+- `APPLICATIONINSIGHTS_CONNECTION_STRING` → KV secret `app-insights-connection-string`
+
+**NOTE:** `LOGIC_APP_EMAIL_URL` and `AZURE_STORAGE_CONNECTION_STRING` are required by `settings.py` (copied from apps_services) even though the scheduler doesn't use them. They must be set or the app fails to start.
 
 ## Deployment Target
 
@@ -159,17 +166,19 @@ All secrets stored in Key Vault (`eventus-apps`). Function app references via se
 |--------------|-----|--------|
 | Removed TimeoutTracker | Unlimited timeout eliminates need for tracking | Code simpler, services can run longer |
 | Removed polling time limits | Keystone ASP has no timeout | Polling continues until completion |
-| Disabled timer trigger | Safe migration testing | Enable in Phase 4 after verification |
+| Timer now active | Validated 2026-02-23 — full end-to-end test passed | Scheduler runs every 15 min |
 | Increased REQUEST_TIMEOUT | Allow longer service calls | Services get full 10-minute calls instead of 5 |
 
 ## Migration Phase
 
-**Current Status:** Phase 2 - New infrastructure deployed, timer disabled for testing
+**Current Status:** Phase 3 - Timer active, scheduler validated end-to-end on 2026-02-23
 
 **Timeline:**
-- Phase 2 (now): Deploy fx-app-apps-services with timer disabled
-- Phase 3: Migrate other fx apps to distributed status endpoints
-- Phase 4: Enable timer, decommission apps_services
+- Phase 2 (complete): Deploy fx-app-apps-services with timer disabled
+- Phase 3 (now): Timer enabled, scheduler running in production
+- Phase 4: Decommission apps_services once all fx apps migrated
+
+**Validation (2026-02-23):** Manual trigger confirmed working — triggered hello-world on fx-app-template, polled `apps_master_services_log`, updated scheduling table. 6.42s end-to-end.
 
 ## Testing Checklist
 
@@ -207,6 +216,9 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 | "Timeout approaching" in logs | Still references TimeoutTracker | Check timer_function.py was modified correctly |
 | Services fail after 10 minutes | Timer trigger still has old timeout | Verify host.json has `"functionTimeout": "-1"` |
 | Status endpoint returns 404 | log_id doesn't exist | Verify log_id is in apps_master_services_log |
+| HTTP 500 empty body on any endpoint | Missing required env vars (`LOGIC_APP_EMAIL_URL`, `AZURE_STORAGE_CONNECTION_STRING`) causing Pydantic ValidationError in `SQLClient.__init__()` before try block | Verify both settings are set in Azure portal |
+| `AADSTS500011: resource not found` error | Wrong `SQL_EXECUTOR_SCOPE` — must use UUID (`api://8b3542fd-41c7-4aec-b14d-d0ee8342e57a/.default`), not URI | Update scope setting |
+| SQL auth fails silently | KV references for `SQL_EXECUTOR_CLIENT_ID/SECRET/TENANT_ID` pointing to wrong secret names | Use `executor-client-id`, `executor-client-secret`, `azure-tenant-id` |
 
 ## Notes
 
