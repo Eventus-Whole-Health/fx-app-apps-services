@@ -1,6 +1,6 @@
-# CLAUDE.md - fx-app-apps-services
+# CLAUDE.md
 
-This file provides guidance to Claude Code when working with this function app.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -53,13 +53,15 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 `function_app.py` - Configures Seq logging BEFORE creating FunctionApp, then registers blueprints:
 - `scheduler_bp` - Timer and manual trigger for scheduler
 - `master_services_log_bp` - Status/result endpoints
+- `trigger_bp` - Trigger any cataloged function app
 
 ### Function Modules
 
 | Module | Purpose | Key Files |
 |--------|---------|-----------|
-| **scheduler** | Processes scheduled services, no timeout limits | `timer_function.py` (1,307 lines, simplified) |
+| **scheduler** | Processes scheduled services, no timeout limits | `timer_function.py` |
 | **master_services_log** | Status tracking endpoints | `status_endpoints.py` (distributed async tracking) |
+| **trigger_function** | Trigger any cataloged function app by ID or name | `trigger_function.py` (reads `apps_function_apps` catalog) |
 
 ### Shared Services (Copied Verbatim from apps_services)
 
@@ -99,6 +101,7 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 |-------|---------|-------|
 | `jgilpatrick.apps_master_services_log` | Execution tracking for all services | Tracks parent_id, root_id for workflow context |
 | `jgilpatrick.apps_central_scheduling` | Scheduled service definitions | Scheduler reads this to determine what to trigger |
+| `jgilpatrick.apps_function_apps` | Function app catalog | Trigger module looks up endpoints, auth method, host keys |
 
 ## API Endpoints
 
@@ -115,6 +118,12 @@ sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -
 
 - `GET /api/status/{log_id}` - Check service status (pending/success/failed)
 - `GET /api/result/{log_id}` - Get complete result with request/response data
+
+### Trigger Endpoints
+
+- `POST /api/trigger/{id}` - Trigger a cataloged function by its `apps_function_apps` ID
+- `POST /api/trigger?app={app_name}&function={function_name}` - Trigger by app/function name
+- `GET /api/trigger/list` - List all cataloged functions
 
 ## Standard Function Pattern
 
@@ -188,7 +197,7 @@ When deploying changes:
 - [ ] Manual scheduler trigger executes without timeout errors
 - [ ] Long-running services (15+ min) complete successfully
 - [ ] Seq logs show no timeout warnings
-- [ ] Timer remains disabled (Day 0 schedule still impossible date)
+- [ ] Timer trigger fires every 15 minutes as expected
 - [ ] All logging layers working (Seq, SQL, App Insights)
 
 ## Debugging
