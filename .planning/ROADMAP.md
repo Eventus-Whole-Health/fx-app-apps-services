@@ -28,11 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A watchdog process identifies rows "running" longer than the configured threshold and marks them timed out
   4. Services with `max_retries > 0` automatically retry on failure with exponential backoff, and retry attempts are visible in the log
   5. Schedules fire correctly in Eastern time including across DST transitions, and daily/weekly/monthly/hourly/once frequency types all evaluate without false triggers or skipped runs
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: Status lifecycle and error capture — fix pending→running→terminal transitions and ensure all failure paths log correctly
-- [ ] 01-02: Watchdog and retry — implement stuck row detection and configurable exponential backoff retry
+- [ ] 01-01-PLAN.md — Status lifecycle and error capture: fix pending->running->terminal transitions in master services log, ensure all failure paths log to SQL+Seq, fix schedule evaluation for all frequency types and DST (SCHED-01, SCHED-02, SCHED-05)
+- [ ] 01-02-PLAN.md — Watchdog and retry: configurable per-service stuck row detection, exponential backoff retry with max_retries, bounded polling loop (SCHED-03, SCHED-04)
 
 ### Phase 2: API Layer
 **Goal**: fx-app-apps-services exposes clean endpoints that return accurate scheduler state, execution history, health summaries, and support CRUD and manual trigger operations
