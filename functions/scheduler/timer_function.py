@@ -346,7 +346,7 @@ async def process_scheduled_services_with_overrides(
             
             if not services_response or not isinstance(services_response, list):
                 LOGGER.info("📭 No active services found in database")
-                return results, timeout_tracker
+                return results
             
             services = services_response
             LOGGER.info(f"📋 Found {len(services)} active services to evaluate")
@@ -504,6 +504,11 @@ async def process_scheduled_services_with_overrides(
             error_msg = f"Error fetching or processing scheduled services: {str(e)}"
             results["errors"].append(error_msg)
             LOGGER.error(error_msg)
+            # Emit structured Seq event for processing failure
+            LOGGER.error(f"Scheduler service processing failed", extra={
+                "EventType": "SchedulerProcessingFailed",
+                "ErrorMessage": str(e)[:500]
+            })
             await track_exception(e, {"operation": "fetch_scheduled_services"})
 
     return results
@@ -783,6 +788,16 @@ async def handle_service_failure_no_retry(sql_client: SQLClient, service: Dict[s
         method="execute",
         title=f"Mark service {service_id} as failed (no retry)"
     )
+    # Emit structured Seq event for service failure
+    LOGGER.error(f"Service {service_id} failed", extra={
+        "EventType": "ScheduledServiceFailed",
+        "ServiceId": service_id,
+        "FunctionApp": service["function_app"],
+        "Service": service["service"],
+        "ResponseCode": response_code,
+        "LogId": log_id,
+        "ErrorMessage": sanitize_sql_string(response_detail)[:500]
+    })
     if log_id is not None:
         LOGGER.error(f"Service {service_id} failed and marked as failed (log_id: {log_id}, no retries to prevent duplicate emails)")
     else:
@@ -915,11 +930,11 @@ async def execute_service_request(
 async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any], error_msg: str) -> None:
     """Handle service processing exception."""
     service_id = service["id"]
-    
+
     # Sanitize error message
     sanitized_error = sanitize_sql_string(error_msg)
     eastern_time_sql = get_eastern_time_sql()
-    
+
     try:
         await execute_sql_with_cold_start_retry(
             sql_client,
@@ -936,6 +951,15 @@ async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any
         )
     except Exception as db_error:
         LOGGER.error(f"Failed to update service {service_id} status in database: {str(db_error)}")
+
+    # Emit structured Seq event for service exception
+    LOGGER.error(f"Service {service_id} exception", extra={
+        "EventType": "ScheduledServiceException",
+        "ServiceId": service_id,
+        "FunctionApp": service.get("function_app", "unknown"),
+        "Service": service.get("service", "unknown"),
+        "ErrorMessage": sanitize_sql_string(error_msg)[:500]
+    })
 
 
 # Create the blueprint for scheduler functions
@@ -956,25 +980,44 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
     7. Only logs to master services log when services are actually triggered
     """
     LOGGER.info("Scheduler timer function started")
-    
-    # Initialize master service logger for this timer execution (but don't log yet)
+
+    # Initialize master service logger for this timer execution
     master_logger = ServiceLogger(
         service_name="scheduler_timer",
         function_app="fx-app-apps-services",
         trigger_source="timer"
     )
-    
+
     async with SQLClient() as sql_client:
         try:
+            # Log start BEFORE any processing — every timer execution gets a master log row
+            await master_logger.log_start(
+                sql_client,
+                request_data=json.dumps({
+                    "is_past_due": timer.past_due,
+                    "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
+                }),
+                metadata={
+                    "function_type": "timer",
+                    "schedule": "0 0,15,30,45 * * * *",
+                    "is_past_due": timer.past_due
+                }
+            )
+            LOGGER.info(f"Scheduler timer logged to master services log with ID: {master_logger.log_id}")
+
+            # Transition to running before processing
+            await master_logger.log_running(sql_client)
+
             # Track the timer execution start
             await track_event("scheduler_timer_started", {
                 "is_past_due": timer.past_due,
-                "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
+                "schedule_status": str(timer.schedule_status) if timer.schedule_status else None,
+                "master_log_id": master_logger.log_id
             })
-            
+
             if timer.past_due:
                 LOGGER.warning("Timer function is running late")
-            
+
             # Process scheduled services with master logger context
             results = await process_scheduled_services_with_overrides(
                 master_logger=master_logger
@@ -990,65 +1033,54 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
                 f"Stuck services found: {results['stuck_services_found']}"
             )
             LOGGER.info(summary)
-            
+
             # Track completion
             await track_event("scheduler_timer_completed", {
-                **results
+                **results,
+                "master_log_id": master_logger.log_id
             })
-            
-            # Only log to master services log if services were actually executed (not just processed)
-            if results['successful'] > 0 or results['failed'] > 0:
-                # Log start of timer execution to master services log
-                await master_logger.log_start(
+
+            # Log terminal status based on results
+            if results["errors"]:
+                LOGGER.error(f"Errors during processing: {results['errors']}")
+                await master_logger.log_warning(
                     sql_client,
-                    request_data=json.dumps({
-                        "is_past_due": timer.past_due,
-                        "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
-                    }),
+                    f"Completed with {len(results['errors'])} errors",
+                    response_data=json.dumps(results),
                     metadata={
-                        "function_type": "timer",
-                        "schedule": "0 0,15,30,45 * * * *",
-                        "is_past_due": timer.past_due
+                        "errors": results['errors']
                     }
                 )
-                
-                LOGGER.info(f"Scheduler timer logged to master services log with ID: {master_logger.log_id}")
-                
-                if results["errors"]:
-                    LOGGER.error(f"Errors during processing: {results['errors']}")
-                    # Log as warning since some services succeeded
-                    await master_logger.log_warning(
-                        sql_client,
-                        f"Completed with {len(results['errors'])} errors",
-                        response_data=json.dumps(results),
-                        metadata={
-                            "errors": results['errors']
-                        }
-                    )
-                else:
-                    # Log successful completion
-                    await master_logger.log_success(
-                        sql_client,
-                        response_data=json.dumps(results),
-                        metadata={}
-                    )
             else:
-                LOGGER.info("No services were triggered - skipping master services log entry")
-                
+                await master_logger.log_success(
+                    sql_client,
+                    response_data=json.dumps(results),
+                    metadata={}
+                )
+
         except Exception as e:
             error_msg = f"Scheduler timer function failed: {str(e)}"
             LOGGER.error(error_msg)
-            
+
             # Log error to master services log if possible
             try:
-                await master_logger.log_error(
-                    sql_client,
-                    error_msg,
-                    metadata={"exception_type": type(e).__name__}
-                )
+                if master_logger.log_id is not None:
+                    await master_logger.log_error(
+                        sql_client,
+                        error_msg,
+                        metadata={"exception_type": type(e).__name__}
+                    )
+                else:
+                    # log_start failed — try to create a minimal entry
+                    await master_logger.log_start(sql_client)
+                    await master_logger.log_error(
+                        sql_client,
+                        error_msg,
+                        metadata={"exception_type": type(e).__name__}
+                    )
             except Exception as log_error:
                 LOGGER.error(f"Failed to log error to master services log: {str(log_error)}")
-            
+
             await track_exception(e, {
                 "operation": "scheduler_timer",
                 "master_log_id": master_logger.log_id
@@ -1124,7 +1156,10 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             )
             
             LOGGER.info(f"HTTP Scheduler trigger logged to master services log with ID: {master_logger.log_id}")
-            
+
+            # Transition to running before processing
+            await master_logger.log_running(sql_client)
+
             # Parse request body for options
             bypass_window_check = False
             force_service_ids = None

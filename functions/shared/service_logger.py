@@ -186,6 +186,39 @@ class ServiceLogger:
 
         return self.log_id
 
+    async def log_running(
+        self,
+        sql_client: SQLClient,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Transition service status from pending to running in master services log.
+
+        Called after log_start() and before the main work begins.
+        Does NOT change _start_time — timing tracks from original start.
+        """
+        if self.log_id is None:
+            raise RuntimeError("Must call log_start() before log_running()")
+
+        if metadata:
+            self.metadata.update(metadata)
+
+        # Update status to running in SQL
+        update_sql = f"""
+        UPDATE jgilpatrick.apps_master_services_log
+        SET status = 'running'
+        WHERE log_id = {self.log_id}
+        """
+
+        await sql_client.execute(
+            update_sql,
+            method="execute",
+            title=f"Log running status for {self.service_name}"
+        )
+
+        # Emit Seq event
+        self._emit_seq_event("ServiceRunning", "running")
+
     async def log_success(
         self,
         sql_client: SQLClient,
@@ -238,6 +271,26 @@ class ServiceLogger:
         # Emit Seq event
         duration_ms = (time.time() - self._start_time) * 1000
         self._emit_seq_event("ServiceWarning", "warning", duration_ms=duration_ms, error_message=warning_message)
+
+    async def log_timeout(
+        self,
+        sql_client: SQLClient,
+        timeout_message: str,
+        response_data: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Log timeout of service execution."""
+        await self._log_completion(
+            sql_client,
+            "timeout",
+            response_data,
+            metadata,
+            error_message=timeout_message
+        )
+
+        # Emit Seq event
+        duration_ms = (time.time() - self._start_time) * 1000
+        self._emit_seq_event("ServiceTimeout", "timeout", duration_ms=duration_ms, error_message=timeout_message)
 
     async def _log_completion(
         self,
