@@ -1,7 +1,9 @@
 """Scheduler management API endpoints for the Keystone dashboard.
 
-Provides read-only endpoints for listing schedules with health status,
-execution history with pagination and filtering, and aggregate health summary.
+Provides endpoints for listing schedules with health status, execution
+history with pagination and filtering, aggregate health summary, schedule
+CRUD (create, update, soft-delete) with validation, and manual trigger
+using existing scheduler infrastructure.
 """
 from __future__ import annotations
 
@@ -1188,3 +1190,152 @@ async def delete_schedule(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500,
                 mimetype="application/json",
             )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/scheduler/services/{service_id}/trigger — Manual trigger
+# ---------------------------------------------------------------------------
+@bp.route(route="scheduler/services/{service_id}/trigger", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def trigger_service(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Manually trigger a specific scheduled service.
+
+    Reuses the existing scheduler infrastructure via
+    process_scheduled_services_with_overrides(force_service_ids=[id],
+    bypass_window_check=True). The endpoint awaits the full execution
+    (Keystone ASP unlimited timeout) and returns the result with a log_id
+    that the dashboard can use to poll /api/status/{log_id}.
+
+    POST /api/scheduler/services/{service_id}/trigger
+
+    Response (200):
+    {
+        "success": true,
+        "data": {
+            "service_id": 1,
+            "triggered": true,
+            "message": "Service triggered successfully",
+            "log_id": 5001,
+            "status_url": "/api/status/5001",
+            "result": {...}
+        }
+    }
+    """
+    service_id = req.route_params.get("service_id")
+    LOGGER.info(f"Manual trigger request for service {service_id}")
+
+    # Validate service_id
+    try:
+        service_id_int = int(service_id)
+    except (ValueError, TypeError):
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid service_id", "detail": "service_id must be a number"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    async with SQLClient() as sql:
+        try:
+            # Verify service exists and is active
+            lookup_query = f"""
+                SELECT id, function_app, service, is_active
+                FROM jgilpatrick.apps_central_scheduling
+                WHERE id = {service_id_int}
+            """
+            lookup_result = await sql.execute(lookup_query, method="query", title=f"Look up service {service_id_int} for trigger")
+
+            if not lookup_result or len(lookup_result) == 0:
+                return func.HttpResponse(
+                    json.dumps({"error": "Service not found", "detail": f"No schedule with id {service_id_int}"}),
+                    status_code=404,
+                    mimetype="application/json",
+                )
+
+            service_row = lookup_result[0]
+            if not service_row.get("is_active"):
+                return func.HttpResponse(
+                    json.dumps({"error": "Service inactive", "detail": f"Schedule {service_id_int} is inactive and cannot be triggered"}),
+                    status_code=400,
+                    mimetype="application/json",
+                )
+
+        except Exception as e:
+            error_msg = f"Error looking up service {service_id}: {str(e)}"
+            LOGGER.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": "Internal server error", "detail": "Failed to look up service"}),
+                status_code=500,
+                mimetype="application/json",
+            )
+
+    # Import and call the existing scheduler trigger function
+    # Using absolute import since both modules are under the functions package
+    try:
+        from ..scheduler.timer_function import process_scheduled_services_with_overrides
+    except ImportError:
+        LOGGER.error("Failed to import process_scheduled_services_with_overrides from scheduler module")
+        return func.HttpResponse(
+            json.dumps({"error": "Internal server error", "detail": "Scheduler module not available"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    try:
+        # Trigger the service using existing infrastructure
+        # bypass_window_check=True means run now regardless of schedule window
+        result = await process_scheduled_services_with_overrides(
+            force_service_ids=[service_id_int],
+            bypass_window_check=True,
+        )
+
+        # After trigger completes, query for the log_id from the scheduling table
+        # The scheduler stores the most recent log_id in apps_central_scheduling.log_id
+        log_id = None
+        status_url = None
+
+        async with SQLClient() as sql:
+            try:
+                log_query = f"""
+                    SELECT log_id FROM jgilpatrick.apps_central_scheduling
+                    WHERE id = {service_id_int}
+                """
+                log_result = await sql.execute(log_query, method="query", title=f"Get log_id for triggered service {service_id_int}")
+                if log_result and log_result[0].get("log_id"):
+                    log_id = log_result[0]["log_id"]
+                    status_url = f"/api/status/{log_id}"
+            except Exception:
+                pass  # log_id is optional — don't fail the response if we can't get it
+
+        triggered = result.get("processed", 0) > 0
+
+        response_data = {
+            "success": True,
+            "data": {
+                "service_id": service_id_int,
+                "triggered": triggered,
+                "message": "Service triggered successfully" if triggered else "Service was not triggered (may already be processing)",
+                "log_id": log_id,
+                "status_url": status_url,
+                "result": {
+                    "processed": result.get("processed", 0),
+                    "successful": result.get("successful", 0),
+                    "failed": result.get("failed", 0),
+                },
+            },
+        }
+
+        LOGGER.info(f"Service {service_id_int} triggered: processed={result.get('processed', 0)}, log_id={log_id}")
+        return func.HttpResponse(
+            json.dumps(response_data, indent=2, default=str),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        error_msg = f"Error triggering service {service_id}: {str(e)}"
+        LOGGER.error(error_msg)
+        return func.HttpResponse(
+            json.dumps({"error": "Trigger failed", "detail": f"Failed to trigger service: {str(e)[:200]}"}),
+            status_code=500,
+            mimetype="application/json",
+        )
