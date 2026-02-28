@@ -506,3 +506,238 @@ async def scheduler_health_summary(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500,
                 mimetype="application/json",
             )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/scheduler/services/{service_id}/history — Execution history
+# ---------------------------------------------------------------------------
+@bp.route(route="scheduler/services/{service_id}/history", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Get paginated execution history for a specific scheduled service.
+
+    Queries apps_master_services_log filtered by function_app and service_name
+    derived from the schedule definition. Supports filtering by status and
+    date range, with offset-based pagination.
+
+    GET /api/scheduler/services/{service_id}/history
+    Query params: page, page_size, status, start_date, end_date
+
+    Response:
+    {
+        "success": true,
+        "data": {
+            "service_id": 1,
+            "function_app": "ai-scribing-services",
+            "service_name": "daily-transcription-sync",
+            "executions": [...],
+            "pagination": {
+                "page": 1,
+                "page_size": 20,
+                "total": 142,
+                "total_pages": 8
+            }
+        }
+    }
+    """
+    service_id = req.route_params.get("service_id")
+    LOGGER.info(f"Execution history requested for service {service_id}")
+
+    # Validate service_id is numeric
+    if not service_id:
+        return func.HttpResponse(
+            json.dumps({"error": "Missing service_id", "detail": "service_id is required in URL path"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        service_id_int = int(service_id)
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid service_id", "detail": "service_id must be a number"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Parse and validate query parameters
+    try:
+        page = max(1, int(req.params.get("page", "1")))
+    except (ValueError, TypeError):
+        page = 1
+
+    try:
+        page_size = min(100, max(1, int(req.params.get("page_size", "20"))))
+    except (ValueError, TypeError):
+        page_size = 20
+
+    status_filter_value = req.params.get("status")
+    start_date = req.params.get("start_date")
+    end_date = req.params.get("end_date")
+
+    # Validate status filter
+    if status_filter_value and status_filter_value.lower() not in VALID_STATUSES:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Invalid status filter",
+                "detail": f"status must be one of: {', '.join(sorted(VALID_STATUSES))}",
+            }),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate date formats
+    for date_param, date_name in [(start_date, "start_date"), (end_date, "end_date")]:
+        if date_param:
+            try:
+                datetime.fromisoformat(date_param.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                return func.HttpResponse(
+                    json.dumps({
+                        "error": f"Invalid {date_name}",
+                        "detail": f"{date_name} must be a valid ISO 8601 date string",
+                    }),
+                    status_code=400,
+                    mimetype="application/json",
+                )
+
+    async with SQLClient() as sql:
+        try:
+            # Look up the service to get function_app and service name
+            service_query = f"""
+                SELECT id, function_app, service
+                FROM jgilpatrick.apps_central_scheduling
+                WHERE id = {service_id_int}
+            """
+            service_result = await sql.execute(service_query, method="query", title=f"Look up service {service_id_int}")
+
+            if not service_result or len(service_result) == 0:
+                return func.HttpResponse(
+                    json.dumps({"error": "Service not found", "detail": f"No schedule with id {service_id_int}"}),
+                    status_code=404,
+                    mimetype="application/json",
+                )
+
+            service_row = service_result[0]
+            function_app = sanitize_sql_string(service_row["function_app"])
+            service_name = sanitize_sql_string(service_row["service"])
+
+            # Build WHERE clause filters
+            where_clauses = [
+                f"function_app = '{function_app}'",
+                f"service_name = '{service_name}'",
+            ]
+
+            if status_filter_value:
+                safe_status = sanitize_sql_string(status_filter_value.lower())
+                where_clauses.append(f"status = '{safe_status}'")
+
+            if start_date:
+                safe_start = sanitize_sql_string(start_date)
+                where_clauses.append(f"started_at >= '{safe_start}'")
+
+            if end_date:
+                safe_end = sanitize_sql_string(end_date)
+                where_clauses.append(f"started_at <= '{safe_end}'")
+
+            where_sql = " AND ".join(where_clauses)
+            offset = (page - 1) * page_size
+
+            # Count total matching rows
+            count_query = f"""
+                SELECT COUNT(*) as total
+                FROM jgilpatrick.apps_master_services_log
+                WHERE {where_sql}
+            """
+            count_result = await sql.execute(count_query, method="query", title=f"Count history for service {service_id_int}")
+            total = count_result[0]["total"] if count_result else 0
+
+            # Fetch paginated results
+            history_query = f"""
+                SELECT
+                    log_id,
+                    function_app,
+                    service_name,
+                    status,
+                    started_at,
+                    ended_at,
+                    duration_ms,
+                    error_message,
+                    request,
+                    response,
+                    trigger_source
+                FROM jgilpatrick.apps_master_services_log
+                WHERE {where_sql}
+                ORDER BY started_at DESC
+                OFFSET {offset} ROWS
+                FETCH NEXT {page_size} ROWS ONLY
+            """
+            history_result = await sql.execute(history_query, method="query", title=f"Execution history for service {service_id_int}")
+
+            if not history_result:
+                history_result = []
+
+            # Build execution records with parsed request/response JSON
+            executions = []
+            for row in history_result:
+                # Parse request data
+                request_data = None
+                if row.get("request"):
+                    try:
+                        request_data = json.loads(row["request"])
+                    except (json.JSONDecodeError, TypeError):
+                        request_data = row["request"]
+
+                # Parse response data
+                response_data = None
+                if row.get("response"):
+                    try:
+                        response_data = json.loads(row["response"])
+                    except (json.JSONDecodeError, TypeError):
+                        response_data = row["response"]
+
+                executions.append({
+                    "log_id": row.get("log_id"),
+                    "status": row.get("status"),
+                    "started_at": row.get("started_at"),
+                    "ended_at": row.get("ended_at"),
+                    "duration_ms": row.get("duration_ms"),
+                    "error_message": row.get("error_message"),
+                    "request": request_data,
+                    "response": response_data,
+                    "trigger_source": row.get("trigger_source"),
+                })
+
+            total_pages = math.ceil(total / page_size) if total > 0 else 0
+
+            response_body = {
+                "success": True,
+                "data": {
+                    "service_id": service_id_int,
+                    "function_app": service_row["function_app"],
+                    "service_name": service_row["service"],
+                    "executions": executions,
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total,
+                        "total_pages": total_pages,
+                    },
+                },
+            }
+
+            LOGGER.info(f"Returning {len(executions)} history records for service {service_id_int} (page {page}/{total_pages})")
+            return func.HttpResponse(
+                json.dumps(response_body, indent=2, default=str),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        except Exception as e:
+            error_msg = f"Error retrieving execution history for service {service_id}: {str(e)}"
+            LOGGER.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": "Internal server error", "detail": "Failed to retrieve execution history"}),
+                status_code=500,
+                mimetype="application/json",
+            )
