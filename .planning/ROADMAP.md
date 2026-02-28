@@ -12,7 +12,7 @@ The existing scheduler is fundamentally sound but has implementation gaps that c
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Scheduler Reliability** - Fix status lifecycle, error capture, stuck row detection, retry logic, and schedule correctness in fx-app-apps-services
+- [x] **Phase 1: Scheduler Reliability** - Fix status lifecycle, error capture, stuck row detection, retry logic, and schedule correctness in fx-app-apps-services
 - [ ] **Phase 2: API Layer** - Build scheduler management endpoints that serve accurate, real-time data to the dashboard
 - [ ] **Phase 3: Keystone Dashboard** - React UI in Keystone Platform for full visibility and control of all scheduled services
 
@@ -31,8 +31,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Status lifecycle and error capture: fix pending->running->terminal transitions in master services log, ensure all failure paths log to SQL+Seq, fix schedule evaluation for all frequency types and DST (SCHED-01, SCHED-02, SCHED-05)
-- [ ] 01-02-PLAN.md — Watchdog and retry: configurable per-service stuck row detection, exponential backoff retry with max_retries, bounded polling loop (SCHED-03, SCHED-04)
+- [x] 01-01-PLAN.md — Status lifecycle and error capture: fix pending->running->terminal transitions in master services log, ensure all failure paths log to SQL+Seq, fix schedule evaluation for all frequency types and DST (SCHED-01, SCHED-02, SCHED-05)
+- [x] 01-02-PLAN.md — Watchdog and retry: configurable per-service stuck row detection, exponential backoff retry with max_retries, bounded polling loop (SCHED-03, SCHED-04)
 
 ### Phase 2: API Layer
 **Goal**: fx-app-apps-services exposes clean endpoints that return accurate scheduler state, execution history, health summaries, and support CRUD and manual trigger operations
@@ -75,6 +75,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Scheduler Reliability | 0/2 | Not started | - |
+| 1. Scheduler Reliability | 2/2 | Complete | 2026-02-27 |
 | 2. API Layer | 0/2 | Not started | - |
 | 3. Keystone Dashboard | 0/3 | Not started | - |
