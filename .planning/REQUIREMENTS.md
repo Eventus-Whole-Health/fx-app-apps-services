@@ -7,11 +7,11 @@
 
 ### Scheduler Reliability
 
-- [ ] **SCHED-01**: Status lifecycle — rows transition pending → running → success/failed/timeout (never stuck on "pending" after execution)
-- [ ] **SCHED-02**: Error capture — every failure path (HTTP error, timeout, SQL failure, polling failure) is logged with error details to both SQL and Seq
-- [ ] **SCHED-03**: Stuck row detection — watchdog identifies rows "running" longer than configurable threshold and marks them timed out
-- [ ] **SCHED-04**: Configurable retry — failed services automatically retry with exponential backoff, respecting max_retries per service
-- [ ] **SCHED-05**: Schedule evaluation correctness — timezone-aware (Eastern) execution windows, frequency logic, and trigger limits all work reliably across DST transitions
+- [x] **SCHED-01**: Status lifecycle — rows transition pending -> running -> success/failed/timeout (never stuck on "pending" after execution)
+- [x] **SCHED-02**: Error capture — every failure path (HTTP error, timeout, SQL failure, polling failure) is logged with error details to both SQL and Seq
+- [x] **SCHED-03**: Stuck row detection — watchdog identifies rows "running" longer than configurable threshold and marks them timed out
+- [x] **SCHED-04**: Configurable retry — failed services automatically retry with exponential backoff, respecting max_retries per service
+- [x] **SCHED-05**: Schedule evaluation correctness — timezone-aware (Eastern) execution windows, frequency logic, and trigger limits all work reliably across DST transitions
 
 ### Keystone Dashboard
 
@@ -58,11 +58,11 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SCHED-01 | Phase 1 | Pending |
-| SCHED-02 | Phase 1 | Pending |
-| SCHED-03 | Phase 1 | Pending |
-| SCHED-04 | Phase 1 | Pending |
-| SCHED-05 | Phase 1 | Pending |
+| SCHED-01 | Phase 1 | Complete |
+| SCHED-02 | Phase 1 | Complete |
+| SCHED-03 | Phase 1 | Complete |
+| SCHED-04 | Phase 1 | Complete |
+| SCHED-05 | Phase 1 | Complete |
 | DASH-01 | Phase 3 | Pending |
 | DASH-02 | Phase 3 | Pending |
 | DASH-03 | Phase 3 | Pending |
