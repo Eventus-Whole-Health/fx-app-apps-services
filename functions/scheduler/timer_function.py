@@ -26,6 +26,7 @@ MAX_SQL_COLD_START_RETRIES = 3  # Maximum retries for SQL cold starts
 POLLING_INTERVAL = 30  # Poll every 30 seconds for 202 responses
 DEFAULT_MAX_EXECUTION_MINUTES = 30  # Default threshold for stuck service detection
 MAX_POLLING_DURATION = 3300  # 55 minutes max polling (leaves 5 min buffer before next timer)
+RETRY_BASE_DELAY_MINUTES = 2  # Base delay for exponential backoff (2 min, 4 min, 8 min, 16 min, ...)
 
 
 def get_eastern_time_sql() -> str:
@@ -135,6 +136,19 @@ def sanitize_sql_string(value: str, max_length: int = 3900) -> str:
     sanitized = sanitized.replace("\\", "\\\\")  # Escape backslashes
     
     return sanitized
+
+
+def calculate_next_retry_at(retry_count: int, base_delay_minutes: int = RETRY_BASE_DELAY_MINUTES) -> str:
+    """
+    Calculate the next retry time using exponential backoff.
+    Returns a SQL expression for the next retry datetime in Eastern time.
+
+    Backoff schedule: 2min, 4min, 8min, 16min, 32min, 64min, ...
+    Capped at 120 minutes (2 hours) to prevent excessive delay.
+    """
+    delay_minutes = min(base_delay_minutes * (2 ** retry_count), 120)
+    eastern_time_sql = get_eastern_time_sql()
+    return f"DATEADD(minute, {delay_minutes}, {eastern_time_sql})"
 
 
 def is_within_schedule_window(current_time: datetime, scheduled_time_str: str, window_minutes: int = 15) -> bool:
@@ -322,30 +336,34 @@ async def process_scheduled_services_with_overrides(
                     """
                 else:
                     # Normal conditions with service ID filter
+                    eastern_time_sql = get_eastern_time_sql()
                     fetch_services_sql = f"""
-                        SELECT id, function_app, service, trigger_url, json_body, 
-                               start_date, frequency, schedule_config, 
-                               triggered_count, trigger_limit, last_triggered_at, 
+                        SELECT id, function_app, service, trigger_url, json_body,
+                               start_date, frequency, schedule_config,
+                               triggered_count, trigger_limit, last_triggered_at,
                                retry_count, max_retries
                         FROM jgilpatrick.apps_central_scheduling
-                        WHERE is_active = 1 
+                        WHERE is_active = 1
                         AND status IN ('pending', 'failed')
                         AND (trigger_limit IS NULL OR triggered_count < trigger_limit)
+                        AND (next_retry_at IS NULL OR next_retry_at <= {eastern_time_sql})
                         {service_filter}
                         ORDER BY start_date ASC
                     """
             else:
                 service_filter = ""
                 # Standard query with normal conditions
+                eastern_time_sql = get_eastern_time_sql()
                 fetch_services_sql = f"""
-                    SELECT id, function_app, service, trigger_url, json_body, 
-                           start_date, frequency, schedule_config, 
-                           triggered_count, trigger_limit, last_triggered_at, 
+                    SELECT id, function_app, service, trigger_url, json_body,
+                           start_date, frequency, schedule_config,
+                           triggered_count, trigger_limit, last_triggered_at,
                            retry_count, max_retries
                     FROM jgilpatrick.apps_central_scheduling
-                    WHERE is_active = 1 
+                    WHERE is_active = 1
                     AND status IN ('pending', 'failed')
                     AND (trigger_limit IS NULL OR triggered_count < trigger_limit)
+                    AND (next_retry_at IS NULL OR next_retry_at <= {eastern_time_sql})
                     {service_filter}
                     ORDER BY start_date ASC
                 """
@@ -456,8 +474,8 @@ async def process_scheduled_services_with_overrides(
                         await execute_sql_with_cold_start_retry(
                             sql_client,
                             f"""
-                            UPDATE jgilpatrick.apps_central_scheduling 
-                            SET status = '{next_status}', 
+                            UPDATE jgilpatrick.apps_central_scheduling
+                            SET status = '{next_status}',
                                 triggered_count = triggered_count + 1,
                                 last_triggered_at = {eastern_time_sql},
                                 last_response_code = {response_code},
@@ -465,6 +483,7 @@ async def process_scheduled_services_with_overrides(
                                 processed_at = {eastern_time_sql},
                                 error_message = NULL,
                                 retry_count = 0,
+                                next_retry_at = NULL,
                                 log_id = {log_id_value}
                             WHERE id = {service_id}
                             """,
@@ -490,7 +509,7 @@ async def process_scheduled_services_with_overrides(
                         
                     else:
                         # Handle failure - no retries to prevent duplicate email sends
-                        await handle_service_failure_no_retry(sql_client, service, current_time, response_code, response_detail, log_id)
+                        await handle_service_failure(sql_client, service, current_time, response_code, response_detail, log_id)
                         results["failed"] += 1
                         if log_id is not None:
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}, log_id: {log_id}): {response_detail[:200]}...")
@@ -823,72 +842,108 @@ def get_next_status(service: Dict[str, Any]) -> str:
     return "pending"
 
 
-async def handle_service_failure_no_retry(sql_client: SQLClient, service: Dict[str, Any], current_time: datetime, response_code: int, response_detail: str, log_id: Optional[int] = None) -> None:
-    """Handle service execution failure without retries to prevent duplicate email sends."""
+async def handle_service_failure(
+    sql_client: SQLClient,
+    service: Dict[str, Any],
+    current_time: datetime,
+    response_code: int,
+    response_detail: str,
+    log_id: Optional[int] = None
+) -> None:
+    """
+    Handle service execution failure with configurable retry.
+
+    If max_retries > 0 and retry_count < max_retries: schedule retry with exponential backoff.
+    If max_retries == 0 or retries exhausted: mark as failed permanently.
+    """
     service_id = service["id"]
-    
-    # Sanitize response detail
+    max_retries = service.get("max_retries") or 0
+    retry_count = service.get("retry_count") or 0
+
     sanitized_detail = sanitize_sql_string(response_detail)
     eastern_time_sql = get_eastern_time_sql()
-    
-    # Build log_id value (NULL if not provided)
     log_id_value = str(log_id) if log_id is not None else "NULL"
-    
-    # Mark as failed immediately - no retries to prevent duplicate email sends
-    await execute_sql_with_cold_start_retry(
-        sql_client,
-        f"""
-        UPDATE jgilpatrick.apps_central_scheduling
-        SET status = 'failed',
-            processed_at = {eastern_time_sql},
-            last_response_code = {response_code},
-            last_response_detail = '{sanitized_detail}',
-            error_message = 'Service execution failed with HTTP {response_code}',
-            log_id = {log_id_value}
-        WHERE id = {service_id}
-        """,
-        method="execute",
-        title=f"Mark service {service_id} as failed (no retry)"
-    )
-    # Emit structured Seq event for service failure
-    LOGGER.error(f"Service {service_id} failed", extra={
-        "EventType": "ScheduledServiceFailed",
-        "ServiceId": service_id,
-        "FunctionApp": service["function_app"],
-        "Service": service["service"],
-        "ResponseCode": response_code,
-        "LogId": log_id,
-        "ErrorMessage": sanitize_sql_string(response_detail)[:500]
-    })
-    if log_id is not None:
-        LOGGER.error(f"Service {service_id} failed and marked as failed (log_id: {log_id}, no retries to prevent duplicate emails)")
+
+    if max_retries > 0 and retry_count < max_retries:
+        # Schedule retry with exponential backoff
+        next_retry_sql = calculate_next_retry_at(retry_count)
+        new_retry_count = retry_count + 1
+        delay_minutes = min(RETRY_BASE_DELAY_MINUTES * (2 ** retry_count), 120)
+
+        retry_msg = sanitize_sql_string(
+            f"Retry {new_retry_count}/{max_retries} scheduled (backoff: {delay_minutes}min). Last error: HTTP {response_code}"
+        )
+
+        await execute_sql_with_cold_start_retry(
+            sql_client,
+            f"""
+            UPDATE jgilpatrick.apps_central_scheduling
+            SET status = 'pending',
+                retry_count = {new_retry_count},
+                next_retry_at = {next_retry_sql},
+                processed_at = {eastern_time_sql},
+                last_response_code = {response_code},
+                last_response_detail = '{sanitized_detail}',
+                error_message = '{retry_msg}',
+                log_id = {log_id_value}
+            WHERE id = {service_id}
+            """,
+            method="execute",
+            title=f"Schedule retry {new_retry_count}/{max_retries} for service {service_id}"
+        )
+
+        LOGGER.warning(
+            f"Service {service_id} failed — retry {new_retry_count}/{max_retries} scheduled in {delay_minutes} minutes",
+            extra={
+                "EventType": "ScheduledServiceRetry",
+                "ServiceId": service_id,
+                "FunctionApp": service["function_app"],
+                "Service": service["service"],
+                "RetryCount": new_retry_count,
+                "MaxRetries": max_retries,
+                "BackoffMinutes": delay_minutes,
+                "ResponseCode": response_code
+            }
+        )
     else:
-        LOGGER.error(f"Service {service_id} failed and marked as failed (no retries to prevent duplicate emails)")
+        # No retries or retries exhausted — mark as failed permanently
+        exhaustion_note = ""
+        if max_retries > 0:
+            exhaustion_note = f" (retries exhausted: {retry_count}/{max_retries})"
 
+        fail_msg = sanitize_sql_string(
+            f"Service execution failed with HTTP {response_code}{exhaustion_note}"
+        )
 
-def is_sleeping_service_response(response_code: int, response_detail: str) -> bool:
-    """Determine if the response indicates a sleeping Azure Function App."""
-    # Common indicators of sleeping services
-    sleeping_indicators = [
-        "function host is not running",
-        "service unavailable",
-        "502 bad gateway",
-        "503 service unavailable",
-        "cold start",
-        "warming up",
-        "host not available"
-    ]
-    
-    # Check for specific status codes that often indicate sleeping services
-    if response_code in [502, 503, 504]:
-        return True
-    
-    # Check response text for sleeping indicators
-    if response_detail:
-        response_lower = response_detail.lower()
-        return any(indicator in response_lower for indicator in sleeping_indicators)
-    
-    return False
+        await execute_sql_with_cold_start_retry(
+            sql_client,
+            f"""
+            UPDATE jgilpatrick.apps_central_scheduling
+            SET status = 'failed',
+                processed_at = {eastern_time_sql},
+                last_response_code = {response_code},
+                last_response_detail = '{sanitized_detail}',
+                error_message = '{fail_msg}',
+                log_id = {log_id_value}
+            WHERE id = {service_id}
+            """,
+            method="execute",
+            title=f"Mark service {service_id} as failed (no more retries)"
+        )
+
+        LOGGER.error(
+            f"Service {service_id} failed permanently{exhaustion_note}",
+            extra={
+                "EventType": "ScheduledServiceFailed",
+                "ServiceId": service_id,
+                "FunctionApp": service["function_app"],
+                "Service": service["service"],
+                "ResponseCode": response_code,
+                "RetryCount": retry_count,
+                "MaxRetries": max_retries,
+                "ErrorMessage": sanitized_detail[:500]
+            }
+        )
 
 
 async def execute_service_request(
@@ -990,38 +1045,94 @@ async def execute_service_request(
 
 
 async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any], error_msg: str) -> None:
-    """Handle service processing exception."""
-    service_id = service["id"]
+    """
+    Handle service processing exception with configurable retry.
 
-    # Sanitize error message
+    Same retry logic as handle_service_failure: if max_retries > 0 and retries
+    remain, schedule exponential backoff retry; otherwise mark as failed permanently.
+    """
+    service_id = service["id"]
+    max_retries = service.get("max_retries") or 0
+    retry_count = service.get("retry_count") or 0
+
     sanitized_error = sanitize_sql_string(error_msg)
     eastern_time_sql = get_eastern_time_sql()
 
     try:
-        await execute_sql_with_cold_start_retry(
-            sql_client,
-            f"""
-            UPDATE jgilpatrick.apps_central_scheduling
-            SET status = 'failed',
-                processed_at = {eastern_time_sql},
-                last_response_detail = NULL,
-                error_message = '{sanitized_error}'
-            WHERE id = {service_id}
-            """,
-            method="execute",
-            title=f"Mark service {service_id} as failed due to exception"
-        )
+        if max_retries > 0 and retry_count < max_retries:
+            # Schedule retry with exponential backoff
+            next_retry_sql = calculate_next_retry_at(retry_count)
+            new_retry_count = retry_count + 1
+            delay_minutes = min(RETRY_BASE_DELAY_MINUTES * (2 ** retry_count), 120)
+
+            retry_msg = sanitize_sql_string(
+                f"Retry {new_retry_count}/{max_retries} scheduled (backoff: {delay_minutes}min). Exception: {error_msg[:200]}"
+            )
+
+            await execute_sql_with_cold_start_retry(
+                sql_client,
+                f"""
+                UPDATE jgilpatrick.apps_central_scheduling
+                SET status = 'pending',
+                    retry_count = {new_retry_count},
+                    next_retry_at = {next_retry_sql},
+                    processed_at = {eastern_time_sql},
+                    last_response_detail = NULL,
+                    error_message = '{retry_msg}'
+                WHERE id = {service_id}
+                """,
+                method="execute",
+                title=f"Schedule retry {new_retry_count}/{max_retries} for service {service_id} (exception)"
+            )
+
+            LOGGER.warning(
+                f"Service {service_id} exception — retry {new_retry_count}/{max_retries} scheduled in {delay_minutes} minutes",
+                extra={
+                    "EventType": "ScheduledServiceRetry",
+                    "ServiceId": service_id,
+                    "FunctionApp": service.get("function_app", "unknown"),
+                    "Service": service.get("service", "unknown"),
+                    "RetryCount": new_retry_count,
+                    "MaxRetries": max_retries,
+                    "BackoffMinutes": delay_minutes,
+                    "ErrorMessage": sanitized_error[:500]
+                }
+            )
+        else:
+            # No retries or retries exhausted — mark as failed permanently
+            exhaustion_note = ""
+            if max_retries > 0:
+                exhaustion_note = f" (retries exhausted: {retry_count}/{max_retries})"
+
+            fail_msg = sanitize_sql_string(
+                f"Exception during processing{exhaustion_note}: {error_msg[:300]}"
+            )
+
+            await execute_sql_with_cold_start_retry(
+                sql_client,
+                f"""
+                UPDATE jgilpatrick.apps_central_scheduling
+                SET status = 'failed',
+                    processed_at = {eastern_time_sql},
+                    last_response_detail = NULL,
+                    error_message = '{fail_msg}'
+                WHERE id = {service_id}
+                """,
+                method="execute",
+                title=f"Mark service {service_id} as failed due to exception (no more retries)"
+            )
+
+            LOGGER.error(f"Service {service_id} exception — failed permanently{exhaustion_note}", extra={
+                "EventType": "ScheduledServiceException",
+                "ServiceId": service_id,
+                "FunctionApp": service.get("function_app", "unknown"),
+                "Service": service.get("service", "unknown"),
+                "RetryCount": retry_count,
+                "MaxRetries": max_retries,
+                "ErrorMessage": sanitized_error[:500]
+            })
     except Exception as db_error:
         LOGGER.error(f"Failed to update service {service_id} status in database: {str(db_error)}")
-
-    # Emit structured Seq event for service exception
-    LOGGER.error(f"Service {service_id} exception", extra={
-        "EventType": "ScheduledServiceException",
-        "ServiceId": service_id,
-        "FunctionApp": service.get("function_app", "unknown"),
-        "Service": service.get("service", "unknown"),
-        "ErrorMessage": sanitize_sql_string(error_msg)[:500]
-    })
 
 
 # Create the blueprint for scheduler functions
