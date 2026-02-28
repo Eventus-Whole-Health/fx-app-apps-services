@@ -22,15 +22,15 @@ Every scheduled service execution is visible, recoverable, and controllable — 
 - ✓ Manual trigger endpoint — existing
 - ✓ Status/result query endpoints — existing
 - ✓ Function app trigger service with catalog (`apps_function_apps`) — existing
+- ✓ Zero silent failures — every execution outcome captured and queryable — Phase 1
+- ✓ Self-healing — stuck/failed services automatically retry with configurable backoff and max retries — Phase 1
+- ✓ Proper status lifecycle — rows transition pending -> running -> success/failed/timeout — Phase 1
+- ✓ Stuck row detection — watchdog identifies rows running too long, marks them timed out — Phase 1
 
 ### Active
 
 <!-- Current scope. Building toward these. -->
 
-- [ ] Zero silent failures — every execution outcome (success, failure, timeout, skip) is captured and queryable
-- [ ] Self-healing — stuck/failed services automatically retry with configurable backoff and max retries
-- [ ] Proper status lifecycle — rows transition through pending → running → success/failed/timeout (not stuck on "pending" after success)
-- [ ] Stuck row detection — watchdog identifies rows that have been "running" too long and marks them timed out
 - [ ] Keystone dashboard — view all 43+ scheduled services with status, last run, next run, history
 - [ ] Schedule CRUD — create, edit, enable/disable, delete schedules from the UI
 - [ ] Execution history — drill into any service's past runs with timing, status, error details, request/response
@@ -67,9 +67,12 @@ Every scheduled service execution is visible, recoverable, and controllable — 
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Keep custom SQL-backed scheduler over Prefect/Temporal/Airflow | Custom UI requirement in Keystone; off-the-shelf tools add infrastructure and give their own dashboard, not ours | — Pending |
+| Keep custom SQL-backed scheduler over Prefect/Temporal/Airflow | Custom UI requirement in Keystone; off-the-shelf tools add infrastructure and give their own dashboard, not ours | Confirmed — Phase 1 |
 | Dashboard-only visibility (no email/Slack alerts) | Dev team checks dashboard regularly; notification infrastructure adds complexity without proportional value | — Pending |
-| Fix scheduler in-place vs rewrite | Architecture is sound; problems are implementation gaps (error handling, status lifecycle, retry logic) | — Pending |
+| Fix scheduler in-place vs rewrite | Architecture is sound; problems are implementation gaps (error handling, status lifecycle, retry logic) | Confirmed — Phase 1 proved the architecture is sound |
+| Two-step SELECT + batch UPDATE for watchdog | SQL Executor API may not support OUTPUT with UPDATE; two-step avoids compatibility issues | Phase 1 |
+| Retry logic in both failure and exception handlers | Exceptions (network errors, timeouts) deserve retry just like HTTP failures | Phase 1 |
+| Exponential backoff capped at 120 minutes | Prevents excessive delay while giving services meaningful retry windows | Phase 1 |
 
 ---
-*Last updated: 2026-02-27 after initialization*
+*Last updated: 2026-02-27 after Phase 1*

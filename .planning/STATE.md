@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-02-27)
 
 **Core value:** Every scheduled service execution is visible, recoverable, and controllable — no silent failures, no stuck rows, no mystery.
-**Current focus:** Phase 1 — Scheduler Reliability
+**Current focus:** Phase 2 — API Layer
 
 ## Current Position
 
-Phase: 1 of 3 (Scheduler Reliability)
-Plan: 2 of 2 in current phase
-Status: Phase Complete — Awaiting Verification
-Last activity: 2026-02-27 — Completed plan 01-02 (watchdog and retry)
+Phase: 2 of 3 (API Layer)
+Plan: 0 of 0 in current phase
+Status: Ready to plan
+Last activity: 2026-02-27 — Phase 1 complete and verified (SCHED-01 through SCHED-05)
 
 Progress: [███░░░░░░░] 29%
 
@@ -42,22 +42,21 @@ Progress: [███░░░░░░░] 29%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- Keep custom SQL-backed scheduler over Prefect/Temporal/Airflow — custom UI requirement in Keystone
-- Fix scheduler in-place vs rewrite — architecture is sound, problems are implementation gaps
-- Dashboard-only visibility (no email/Slack alerts) — dev team checks dashboard regularly
+- Two-step SELECT + batch UPDATE for watchdog — SQL Executor API compatibility
+- Retry logic in both failure and exception handlers — exceptions deserve retry too
+- Exponential backoff capped at 120 minutes — prevents excessive delay
 
 ### Pending Todos
 
-None yet.
+- Verify `next_retry_at` and `max_execution_minutes` columns exist in apps_central_scheduling (may need ALTER TABLE)
 
 ### Blockers/Concerns
 
-- 43 services in production: Phase 1 changes to `timer_function.py` must be non-breaking — existing services still fire during fix
-- 6 services currently in `failed` status: verify they clear correctly after status lifecycle fix
 - Two separate codebases: fx-app-apps-services (backend) and keystone-platform (frontend) — Phase 3 requires coordinating work across repos
+- Phase 2 API endpoints need to serve accurate data from the scheduler tables — depends on Phase 1 schema being deployed
 
 ## Session Continuity
 
 Last session: 2026-02-27
-Stopped at: Phase 1 complete (both plans executed), running verification next
+Stopped at: Phase 1 complete, ready to plan Phase 2
 Resume file: None
