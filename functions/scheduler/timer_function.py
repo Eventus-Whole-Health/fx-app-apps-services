@@ -24,6 +24,8 @@ SERVICE_REQUEST_TIMEOUT = 600  # 10 minutes timeout per service request (increas
 SQL_COLD_START_RETRY_DELAY = 5  # Wait 5 seconds before retrying SQL operations
 MAX_SQL_COLD_START_RETRIES = 3  # Maximum retries for SQL cold starts
 POLLING_INTERVAL = 30  # Poll every 30 seconds for 202 responses
+DEFAULT_MAX_EXECUTION_MINUTES = 30  # Default threshold for stuck service detection
+MAX_POLLING_DURATION = 3300  # 55 minutes max polling (leaves 5 min buffer before next timer)
 
 
 def get_eastern_time_sql() -> str:
@@ -177,79 +179,86 @@ async def process_scheduled_services() -> Dict[str, Any]:
 
 async def check_and_handle_stuck_processing_services(sql_client: SQLClient, current_time: datetime) -> int:
     """
-    Check for services stuck in 'processing' status for more than 15 minutes or with NULL last_triggered_at and mark them as failed.
-    
+    Check for services stuck in 'processing' status beyond their configured threshold
+    and mark them as failed.
+
+    Uses max_execution_minutes from apps_central_scheduling (defaults to 30 if NULL).
+
     Args:
         sql_client: SQL client instance
         current_time: Current datetime in Eastern timezone
-    
+
     Returns:
         Number of stuck services found and marked as failed
     """
     eastern_time_sql = get_eastern_time_sql()
-    
-    # Query for services stuck in processing status for more than 15 minutes OR with NULL last_triggered_at
-    stuck_services_sql = f"""
-        SELECT id, function_app, service, last_triggered_at
+
+    # Step 1: Find stuck services (for logging)
+    stuck_query = f"""
+        SELECT id, function_app, service
         FROM jgilpatrick.apps_central_scheduling
         WHERE status = 'processing'
         AND (
-            last_triggered_at IS NULL 
-            OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > 15
+            last_triggered_at IS NULL
+            OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > COALESCE(max_execution_minutes, {DEFAULT_MAX_EXECUTION_MINUTES})
         )
     """
-    
+
     try:
         stuck_services = await execute_sql_with_cold_start_retry(
             sql_client,
-            stuck_services_sql,
+            stuck_query,
             method="query",
-            title="Check for stuck processing services"
+            title="Watchdog: find stuck processing services"
         )
-        
-        if not stuck_services or not isinstance(stuck_services, list):
+
+        if not stuck_services or not isinstance(stuck_services, list) or len(stuck_services) == 0:
             return 0
-        
+
         stuck_count = len(stuck_services)
-        if stuck_count > 0:
-            LOGGER.warning(f"🔍 Found {stuck_count} services stuck in 'processing' status (>15 minutes or NULL last_triggered_at)")
-            
-            # Mark all stuck services as failed
-            for service in stuck_services:
-                service_id = service["id"]
-                function_app = service["function_app"]
-                service_name = service["service"]
-                last_triggered = service["last_triggered_at"]
-                
-                if last_triggered is None:
-                    LOGGER.warning(f"   ⚠️  Service {service_id} ({function_app}/{service_name}) stuck with NULL last_triggered_at")
-                    error_message = 'Service execution timeout - stuck in processing status with NULL last_triggered_at'
-                else:
-                    LOGGER.warning(f"   ⚠️  Service {service_id} ({function_app}/{service_name}) stuck since {last_triggered}")
-                    error_message = 'Service execution timeout - stuck in processing status for >15 minutes'
-                
-                # Mark as failed with appropriate error message
-                await execute_sql_with_cold_start_retry(
-                    sql_client,
-                    f"""
-                    UPDATE jgilpatrick.apps_central_scheduling
-                    SET status = 'failed',
-                        processed_at = {eastern_time_sql},
-                        last_response_code = 408,
-                        last_response_detail = NULL,
-                        error_message = '{error_message}'
-                    WHERE id = {service_id}
-                    """,
-                    method="execute",
-                    title=f"Mark stuck service {service_id} as failed"
-                )
-            
-            LOGGER.warning(f"✅ Marked {stuck_count} stuck services as failed")
-        
+        LOGGER.warning(f"Watchdog: found {stuck_count} stuck services exceeding max execution time")
+
+        # Log each stuck service with structured Seq event
+        for svc in stuck_services:
+            LOGGER.warning(
+                f"Watchdog: service {svc['id']} ({svc['function_app']}/{svc['service']}) exceeded threshold",
+                extra={
+                    "EventType": "WatchdogTimeout",
+                    "ServiceId": svc["id"],
+                    "FunctionApp": svc["function_app"],
+                    "Service": svc["service"]
+                }
+            )
+
+        # Step 2: Batch UPDATE all stuck services in a single statement (no N+1)
+        stuck_update = f"""
+            UPDATE jgilpatrick.apps_central_scheduling
+            SET status = 'failed',
+                processed_at = {eastern_time_sql},
+                last_response_code = 408,
+                error_message = 'Watchdog: exceeded max execution time'
+            WHERE status = 'processing'
+            AND (
+                last_triggered_at IS NULL
+                OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > COALESCE(max_execution_minutes, {DEFAULT_MAX_EXECUTION_MINUTES})
+            )
+        """
+
+        await execute_sql_with_cold_start_retry(
+            sql_client,
+            stuck_update,
+            method="execute",
+            title="Watchdog: batch mark stuck services as failed"
+        )
+
+        LOGGER.warning(f"Watchdog: marked {stuck_count} stuck services as failed")
         return stuck_count
-        
+
     except Exception as e:
-        LOGGER.error(f"Error checking for stuck processing services: {str(e)}")
+        LOGGER.error(f"Watchdog error: {str(e)}", extra={
+            "EventType": "WatchdogError",
+            "ErrorMessage": str(e)[:500]
+        })
         return 0
 
 
@@ -744,13 +753,27 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
     return False
 
 
-async def poll_master_log_for_completion(log_id: str) -> tuple[bool, int, str]:
+async def poll_master_log_for_completion(log_id: str, max_duration: int = MAX_POLLING_DURATION) -> tuple[bool, int, str]:
     """
-    Poll the master services log for the given log_id until completion.
+    Poll the master services log for the given log_id until completion or max_duration exceeded.
     Returns (success, http_like_code, detail_message).
-    Polls indefinitely until the service completes.
     """
+    poll_start = time.time()
+
     while True:
+        elapsed = time.time() - poll_start
+        if elapsed >= max_duration:
+            LOGGER.error(
+                f"Polling timeout: service log_id {log_id} did not complete within {max_duration}s",
+                extra={
+                    "EventType": "PollingTimeout",
+                    "LogId": log_id,
+                    "ElapsedSeconds": round(elapsed, 1),
+                    "MaxDuration": max_duration
+                }
+            )
+            return False, 408, f"Polling timeout after {int(elapsed)}s — service did not complete"
+
         try:
             async with SQLClient() as sql_client:
                 rows = await sql_client.execute(
@@ -767,14 +790,14 @@ async def poll_master_log_for_completion(log_id: str) -> tuple[bool, int, str]:
                 status_val = (rows[0].get("status") or "").lower()
                 error_msg = rows[0].get("error_message") or ""
 
-                if status_val in ("success", "failed", "warning"):
+                if status_val in ("success", "failed", "warning", "timeout"):
                     if status_val == "success":
                         return True, 200, "Master log status: success"
                     if status_val == "warning":
                         # Treat as non-fatal but not success
                         return False, 200, "Master log status: warning"
-                    # failed
-                    detail = f"Master log status: failed{(f' - {error_msg}' if error_msg else '')}"
+                    # failed or timeout
+                    detail = f"Master log status: {status_val}{(f' - {error_msg}' if error_msg else '')}"
                     return False, 500, detail
 
             # Not complete yet; wait and continue polling
