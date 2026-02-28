@@ -151,16 +151,20 @@ def is_within_schedule_window(current_time: datetime, scheduled_time_str: str, w
     try:
         # Parse scheduled time
         hour, minute = map(int, scheduled_time_str.split(':'))
-        
+
+        # Validate range — reject malformed values like "24:00" or "12:60"
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return False
+
         # Check if current hour matches
         if current_time.hour != hour:
             return False
-        
+
         # Check if we're within the same 15-minute window
         # Windows are: 00-14, 15-29, 30-44, 45-59
         current_window = current_time.minute // window_minutes
         scheduled_window = minute // window_minutes
-        
+
         return current_window == scheduled_window
     except (ValueError, AttributeError):
         return False
@@ -525,7 +529,18 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
     last_triggered = service["last_triggered_at"]
     start_date = service["start_date"]
     schedule_config = service.get("schedule_config")
-    
+
+    LOGGER.debug(f"Service {service['id']}: evaluating {frequency} schedule (last_triggered: {last_triggered}, start_date: {start_date})")
+
+    # Helper for DST-safe localization of naive datetimes
+    def _safe_localize(dt, tz):
+        """Localize a naive datetime, handling DST ambiguous times gracefully."""
+        try:
+            return tz.localize(dt, is_dst=None)
+        except pytz.exceptions.AmbiguousTimeError:
+            # During DST fall-back transition, assume DST (earlier offset)
+            return tz.localize(dt, is_dst=True)
+
     # Parse last triggered time
     # Database stores Eastern time as naive datetime via jgilpatrick.GetEasternTime()
     eastern = pytz.timezone('US/Eastern')
@@ -540,17 +555,17 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
                 else:
                     # No timezone info, assume Eastern (from SQL GetEasternTime)
                     last_triggered = datetime.fromisoformat(last_triggered)
-                    last_triggered = eastern.localize(last_triggered)
+                    last_triggered = _safe_localize(last_triggered, eastern)
             except (ValueError, AttributeError):
                 # Fallback: parse as naive and assume Eastern
                 last_triggered = datetime.fromisoformat(last_triggered)
-                last_triggered = eastern.localize(last_triggered)
+                last_triggered = _safe_localize(last_triggered, eastern)
         elif hasattr(last_triggered, 'tzinfo'):
             if last_triggered.tzinfo is None:
                 # Naive datetime from SQL - assume Eastern time
-                last_triggered = eastern.localize(last_triggered)
+                last_triggered = _safe_localize(last_triggered, eastern)
             # If already timezone-aware, leave as is
-    
+
     # Parse start date
     # Database stores Eastern time as naive datetime via jgilpatrick.GetEasternTime()
     if isinstance(start_date, str):
@@ -562,77 +577,88 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
             else:
                 # No timezone info, assume Eastern (from SQL GetEasternTime)
                 start_date = datetime.fromisoformat(start_date)
-                start_date = eastern.localize(start_date)
+                start_date = _safe_localize(start_date, eastern)
         except (ValueError, AttributeError):
             start_date = datetime.fromisoformat(start_date)
-            start_date = eastern.localize(start_date)
+            start_date = _safe_localize(start_date, eastern)
     elif hasattr(start_date, 'tzinfo'):
         if start_date.tzinfo is None:
             # Naive datetime from SQL - assume Eastern time
-            start_date = eastern.localize(start_date)
+            start_date = _safe_localize(start_date, eastern)
         # If already timezone-aware, leave as is
-    
+
     # Universal activation check - service doesn't run until start_date is reached
     if start_date > current_time:
         return False
-    
+
     if frequency == "once":
         # One-time trigger: check if not already triggered
         # Note: start_date check already done above
         return last_triggered is None
-    
+
     elif frequency == "daily":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 times = config.get("times", ["00:00"])
-                
+
                 # Check if current time is within any configured time windows (if window check enabled)
                 if check_window:
                     matches_time_window = any(
-                        is_within_schedule_window(current_time, time_str) 
+                        is_within_schedule_window(current_time, time_str)
                         for time_str in times
                     )
-                    
+
                     if not matches_time_window:
                         return False
-                
+
                 # Check if already triggered today
                 if last_triggered:
                     return last_triggered.date() < current_time.date()
                 return True
-                
+
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-    
+        else:
+            # No schedule_config: run once per day at any window
+            if last_triggered:
+                return last_triggered.date() < current_time.date()
+            return True
+
     elif frequency == "weekly":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 days = config.get("days", ["monday"])
                 time_str = config.get("time", "00:00")
-                
+
                 # Check if current day matches
                 current_day = current_time.strftime("%A").lower()
                 if current_day not in [day.lower() for day in days]:
                     return False
-                
+
                 # Check if current time is within schedule window (if window check enabled)
                 if check_window and not is_within_schedule_window(current_time, time_str):
                     return False
-                
+
                 # Check if already triggered today (allows multiple days per week)
                 # Services can run on multiple days like Monday AND Friday
                 if last_triggered:
                     # Only skip if already triggered today
                     return last_triggered.date() != current_time.date()
                 return True
-                
+
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-    
+        else:
+            # No schedule_config: run once per week on any day
+            if last_triggered:
+                days_since = (current_time.date() - last_triggered.date()).days
+                return days_since >= 7
+            return True
+
     elif frequency == "hourly":
         if schedule_config:
             try:
@@ -675,32 +701,45 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-    
+        else:
+            # No schedule_config: run once per hour
+            if last_triggered:
+                same_hour = (last_triggered.hour == current_time.hour and
+                             last_triggered.date() == current_time.date())
+                return not same_hour
+            return True
+
     elif frequency == "monthly":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 day = config.get("day", 1)
                 time_str = config.get("time", "00:00")
-                
+
                 # Check if current day of month matches
                 if current_time.day != day:
                     return False
-                
+
                 # Check if current time is within schedule window (if window check enabled)
                 if check_window and not is_within_schedule_window(current_time, time_str):
                     return False
-                
+
                 # Check if already triggered this month
                 if last_triggered:
-                    return (last_triggered.month != current_time.month or 
-                           last_triggered.year != current_time.year)
+                    return (last_triggered.month != current_time.month or
+                            last_triggered.year != current_time.year)
                 return True
-                
+
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-    
+        else:
+            # No schedule_config: run once per month
+            if last_triggered:
+                return (last_triggered.month != current_time.month or
+                        last_triggered.year != current_time.year)
+            return True
+
     # Default: don't trigger for unknown frequencies
     return False
 
