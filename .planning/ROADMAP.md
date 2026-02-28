@@ -44,11 +44,11 @@ Plans:
   3. CRUD endpoints create, update, and delete schedule definitions with validation (no invalid cron, no orphan service IDs)
   4. A manual trigger endpoint accepts a service ID, triggers that service, and returns a tracking ID that can be polled for completion status
   5. A health summary endpoint returns aggregate counts (total, healthy, degraded, failing) for the dashboard header
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: Read endpoints — list schedules with health, execution history, health summary
-- [ ] 02-02: Write endpoints — schedule CRUD and manual trigger with validation
+- [ ] 02-01-PLAN.md — Read endpoints: list all schedules with computed health status, execution history with pagination and filtering, aggregate health summary (API-01, API-02, API-05)
+- [ ] 02-02-PLAN.md — Write endpoints: schedule CRUD (create, update, soft-delete) with validation, manual trigger using existing scheduler infrastructure (API-03, API-04)
 
 ### Phase 3: Keystone Dashboard
 **Goal**: Developers can see every scheduled service's status, history, and health at a glance, and can create, edit, trigger, or disable any service from the UI without touching SQL directly
