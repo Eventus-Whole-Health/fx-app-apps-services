@@ -741,3 +741,450 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500,
                 mimetype="application/json",
             )
+
+
+# ---------------------------------------------------------------------------
+# Validation helper for CRUD operations
+# ---------------------------------------------------------------------------
+def validate_schedule_input(data: Dict[str, Any], require_all: bool = True) -> Tuple[bool, Optional[str]]:
+    """
+    Validate schedule input data for create/update operations.
+
+    Args:
+        data: Request body dictionary
+        require_all: If True (create), require frequency/trigger_url/function_app/service.
+                     If False (update), only validate fields that are present.
+
+    Returns:
+        Tuple of (is_valid, error_message). error_message is None if valid.
+    """
+    # Check required fields for create
+    if require_all:
+        if not data.get("frequency"):
+            return False, "frequency is required"
+        if not data.get("trigger_url"):
+            return False, "trigger_url is required"
+        if not data.get("function_app"):
+            return False, "function_app is required"
+        if not data.get("service"):
+            return False, "service is required"
+
+    # Validate frequency if provided
+    frequency = data.get("frequency")
+    if frequency is not None:
+        if not isinstance(frequency, str) or frequency.strip().lower() not in VALID_FREQUENCIES:
+            return False, f"frequency must be one of: {', '.join(sorted(VALID_FREQUENCIES))}"
+
+    # Validate trigger_url if provided
+    trigger_url = data.get("trigger_url")
+    if trigger_url is not None:
+        if not isinstance(trigger_url, str) or not trigger_url.strip():
+            return False, "trigger_url must be a non-empty string"
+
+    # Validate function_app if provided
+    function_app = data.get("function_app")
+    if function_app is not None:
+        if not isinstance(function_app, str) or not function_app.strip():
+            return False, "function_app must be a non-empty string"
+
+    # Validate service if provided
+    service = data.get("service")
+    if service is not None:
+        if not isinstance(service, str) or not service.strip():
+            return False, "service must be a non-empty string"
+
+    # Validate schedule_config is valid JSON if provided
+    schedule_config = data.get("schedule_config")
+    if schedule_config is not None and schedule_config != "":
+        if isinstance(schedule_config, str):
+            try:
+                json.loads(schedule_config)
+            except (json.JSONDecodeError, TypeError):
+                return False, "schedule_config must be valid JSON"
+
+    return True, None
+
+
+def _sql_value(value: Any, field_type: str = "string") -> str:
+    """
+    Convert a Python value to a SQL-safe string for insertion.
+
+    Args:
+        value: The Python value to convert
+        field_type: One of "string", "int", "bool", "nullable_string", "nullable_int"
+
+    Returns:
+        SQL-safe string representation
+    """
+    if value is None:
+        return "NULL"
+
+    if field_type == "bool":
+        return "1" if value else "0"
+    elif field_type in ("int", "nullable_int"):
+        try:
+            return str(int(value))
+        except (ValueError, TypeError):
+            return "NULL"
+    elif field_type in ("string", "nullable_string"):
+        return f"'{sanitize_sql_string(str(value))}'"
+    else:
+        return f"'{sanitize_sql_string(str(value))}'"
+
+
+# System-managed fields that cannot be set via API
+SYSTEM_MANAGED_FIELDS = {
+    "id", "status", "triggered_count", "last_triggered_at",
+    "retry_count", "next_retry_at", "processed_at", "log_id",
+    "error_message", "last_response_code", "last_response_detail",
+}
+
+# Updatable fields with their SQL types
+UPDATABLE_FIELDS = {
+    "function_app": "string",
+    "service": "string",
+    "trigger_url": "string",
+    "frequency": "string",
+    "schedule_config": "nullable_string",
+    "json_body": "nullable_string",
+    "start_date": "nullable_string",
+    "trigger_limit": "nullable_int",
+    "max_retries": "nullable_int",
+    "max_execution_minutes": "nullable_int",
+    "is_active": "bool",
+}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/scheduler/services — Create a new schedule
+# ---------------------------------------------------------------------------
+@bp.route(route="scheduler/services", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def create_schedule(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Create a new schedule definition in apps_central_scheduling.
+
+    Validates required fields (frequency, trigger_url, function_app, service)
+    and optional fields (schedule_config must be valid JSON). Returns the
+    created service record.
+
+    POST /api/scheduler/services
+
+    Request body:
+    {
+        "function_app": "ai-scribing-services",
+        "service": "new-daily-sync",
+        "trigger_url": "https://...",
+        "frequency": "daily",
+        "schedule_config": "{}",
+        "json_body": "{}",
+        "start_date": "2026-03-01T06:00:00",
+        "trigger_limit": null,
+        "max_retries": 3,
+        "max_execution_minutes": 30
+    }
+
+    Response (201):
+    {
+        "success": true,
+        "data": {"service": {...}}
+    }
+    """
+    LOGGER.info("Create schedule request received")
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid JSON", "detail": "Request body must be valid JSON"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not body:
+        return func.HttpResponse(
+            json.dumps({"error": "Empty request", "detail": "Request body is required"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate input
+    is_valid, error_msg = validate_schedule_input(body, require_all=True)
+    if not is_valid:
+        return func.HttpResponse(
+            json.dumps({"error": "Validation failed", "detail": error_msg}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    async with SQLClient() as sql:
+        try:
+            # Build INSERT query with sanitized values
+            function_app = _sql_value(body["function_app"], "string")
+            service = _sql_value(body["service"], "string")
+            trigger_url = _sql_value(body["trigger_url"], "string")
+            frequency = _sql_value(body["frequency"].strip().lower(), "string")
+            schedule_config = _sql_value(body.get("schedule_config"), "nullable_string")
+            json_body = _sql_value(body.get("json_body"), "nullable_string")
+            start_date = _sql_value(body.get("start_date"), "nullable_string")
+            trigger_limit = _sql_value(body.get("trigger_limit"), "nullable_int")
+            max_retries = _sql_value(body.get("max_retries"), "nullable_int")
+            max_execution_minutes = _sql_value(body.get("max_execution_minutes"), "nullable_int")
+
+            insert_query = f"""
+                INSERT INTO jgilpatrick.apps_central_scheduling
+                    (function_app, service, trigger_url, frequency, schedule_config,
+                     json_body, start_date, trigger_limit, max_retries, max_execution_minutes,
+                     is_active, status, triggered_count, retry_count)
+                VALUES
+                    ({function_app}, {service}, {trigger_url}, {frequency}, {schedule_config},
+                     {json_body}, {start_date}, {trigger_limit}, {max_retries}, {max_execution_minutes},
+                     1, 'pending', 0, 0)
+            """
+
+            await sql.execute(insert_query, method="execute", title="Create new schedule")
+
+            # Query back the newly created row (cannot use SCOPE_IDENTITY via SQL Executor API)
+            safe_app = sanitize_sql_string(body["function_app"])
+            safe_service = sanitize_sql_string(body["service"])
+            fetch_query = f"""
+                SELECT TOP 1 *
+                FROM jgilpatrick.apps_central_scheduling
+                WHERE function_app = '{safe_app}'
+                AND service = '{safe_service}'
+                ORDER BY id DESC
+            """
+            fetch_result = await sql.execute(fetch_query, method="query", title="Fetch newly created schedule")
+
+            created_service = fetch_result[0] if fetch_result else None
+
+            LOGGER.info(f"Schedule created: {body['function_app']}/{body['service']}")
+            return func.HttpResponse(
+                json.dumps({"success": True, "data": {"service": created_service}}, indent=2, default=str),
+                status_code=201,
+                mimetype="application/json",
+            )
+
+        except Exception as e:
+            error_msg = f"Error creating schedule: {str(e)}"
+            LOGGER.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": "Internal server error", "detail": "Failed to create schedule"}),
+                status_code=500,
+                mimetype="application/json",
+            )
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/scheduler/services/{service_id} — Update a schedule
+# ---------------------------------------------------------------------------
+@bp.route(route="scheduler/services/{service_id}", methods=["PUT"], auth_level=func.AuthLevel.ANONYMOUS)
+async def update_schedule(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Update an existing schedule definition. Supports partial updates — only
+    provided fields are modified. System-managed fields (status, triggered_count,
+    retry_count, etc.) cannot be updated via this endpoint.
+
+    PUT /api/scheduler/services/{service_id}
+
+    Request body (any subset):
+    {
+        "frequency": "weekly",
+        "schedule_config": "{}",
+        "trigger_url": "https://...",
+        "is_active": true
+    }
+
+    Response (200):
+    {
+        "success": true,
+        "data": {"service": {...}}
+    }
+    """
+    service_id = req.route_params.get("service_id")
+    LOGGER.info(f"Update schedule request for service {service_id}")
+
+    # Validate service_id
+    try:
+        service_id_int = int(service_id)
+    except (ValueError, TypeError):
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid service_id", "detail": "service_id must be a number"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid JSON", "detail": "Request body must be valid JSON"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    if not body:
+        return func.HttpResponse(
+            json.dumps({"error": "Empty request", "detail": "Request body is required"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Validate provided fields (partial update — don't require all fields)
+    is_valid, error_msg = validate_schedule_input(body, require_all=False)
+    if not is_valid:
+        return func.HttpResponse(
+            json.dumps({"error": "Validation failed", "detail": error_msg}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    # Check for attempts to update system-managed fields
+    attempted_system_fields = set(body.keys()) & SYSTEM_MANAGED_FIELDS
+    if attempted_system_fields:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Validation failed",
+                "detail": f"Cannot update system-managed fields: {', '.join(sorted(attempted_system_fields))}",
+            }),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    async with SQLClient() as sql:
+        try:
+            # Look up existing service
+            lookup_query = f"""
+                SELECT id FROM jgilpatrick.apps_central_scheduling
+                WHERE id = {service_id_int}
+            """
+            lookup_result = await sql.execute(lookup_query, method="query", title=f"Look up service {service_id_int}")
+
+            if not lookup_result or len(lookup_result) == 0:
+                return func.HttpResponse(
+                    json.dumps({"error": "Service not found", "detail": f"No schedule with id {service_id_int}"}),
+                    status_code=404,
+                    mimetype="application/json",
+                )
+
+            # Build dynamic SET clause from provided fields
+            set_clauses = []
+            for field_name, field_type in UPDATABLE_FIELDS.items():
+                if field_name in body:
+                    value = body[field_name]
+                    # Normalize frequency to lowercase
+                    if field_name == "frequency" and value is not None:
+                        value = str(value).strip().lower()
+                    set_clauses.append(f"{field_name} = {_sql_value(value, field_type)}")
+
+            if not set_clauses:
+                return func.HttpResponse(
+                    json.dumps({"error": "No updatable fields", "detail": "Request body contains no recognized updatable fields"}),
+                    status_code=400,
+                    mimetype="application/json",
+                )
+
+            set_sql = ", ".join(set_clauses)
+            update_query = f"""
+                UPDATE jgilpatrick.apps_central_scheduling
+                SET {set_sql}
+                WHERE id = {service_id_int}
+            """
+
+            await sql.execute(update_query, method="execute", title=f"Update schedule {service_id_int}")
+
+            # Fetch the updated row
+            fetch_query = f"""
+                SELECT * FROM jgilpatrick.apps_central_scheduling
+                WHERE id = {service_id_int}
+            """
+            fetch_result = await sql.execute(fetch_query, method="query", title=f"Fetch updated schedule {service_id_int}")
+            updated_service = fetch_result[0] if fetch_result else None
+
+            LOGGER.info(f"Schedule {service_id_int} updated: {', '.join(body.keys())}")
+            return func.HttpResponse(
+                json.dumps({"success": True, "data": {"service": updated_service}}, indent=2, default=str),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        except Exception as e:
+            error_msg = f"Error updating schedule {service_id}: {str(e)}"
+            LOGGER.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": "Internal server error", "detail": "Failed to update schedule"}),
+                status_code=500,
+                mimetype="application/json",
+            )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/scheduler/services/{service_id} — Soft-delete a schedule
+# ---------------------------------------------------------------------------
+@bp.route(route="scheduler/services/{service_id}", methods=["DELETE"], auth_level=func.AuthLevel.ANONYMOUS)
+async def delete_schedule(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Soft-delete a schedule by setting is_active=0.
+
+    This does NOT hard-delete the row — it marks it inactive so it no longer
+    appears in the active schedule list or gets triggered by the scheduler.
+
+    DELETE /api/scheduler/services/{service_id}
+
+    Response (200):
+    {
+        "success": true,
+        "data": {"id": 1, "deleted": true}
+    }
+    """
+    service_id = req.route_params.get("service_id")
+    LOGGER.info(f"Delete schedule request for service {service_id}")
+
+    try:
+        service_id_int = int(service_id)
+    except (ValueError, TypeError):
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid service_id", "detail": "service_id must be a number"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    async with SQLClient() as sql:
+        try:
+            # Check if service exists
+            lookup_query = f"""
+                SELECT id, is_active FROM jgilpatrick.apps_central_scheduling
+                WHERE id = {service_id_int}
+            """
+            lookup_result = await sql.execute(lookup_query, method="query", title=f"Look up service {service_id_int} for deletion")
+
+            if not lookup_result or len(lookup_result) == 0:
+                return func.HttpResponse(
+                    json.dumps({"error": "Service not found", "detail": f"No schedule with id {service_id_int}"}),
+                    status_code=404,
+                    mimetype="application/json",
+                )
+
+            # Soft delete: set is_active = 0
+            delete_query = f"""
+                UPDATE jgilpatrick.apps_central_scheduling
+                SET is_active = 0
+                WHERE id = {service_id_int}
+            """
+
+            await sql.execute(delete_query, method="execute", title=f"Soft-delete schedule {service_id_int}")
+
+            LOGGER.info(f"Schedule {service_id_int} soft-deleted (is_active=0)")
+            return func.HttpResponse(
+                json.dumps({"success": True, "data": {"id": service_id_int, "deleted": True}}, indent=2),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        except Exception as e:
+            error_msg = f"Error deleting schedule {service_id}: {str(e)}"
+            LOGGER.error(error_msg)
+            return func.HttpResponse(
+                json.dumps({"error": "Internal server error", "detail": "Failed to delete schedule"}),
+                status_code=500,
+                mimetype="application/json",
+            )
