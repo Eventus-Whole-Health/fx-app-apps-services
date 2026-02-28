@@ -13,7 +13,7 @@ The existing scheduler is fundamentally sound but has implementation gaps that c
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Scheduler Reliability** - Fix status lifecycle, error capture, stuck row detection, retry logic, and schedule correctness in fx-app-apps-services
-- [ ] **Phase 2: API Layer** - Build scheduler management endpoints that serve accurate, real-time data to the dashboard
+- [x] **Phase 2: API Layer** - Build scheduler management endpoints that serve accurate, real-time data to the dashboard (completed 2026-02-28)
 - [ ] **Phase 3: Keystone Dashboard** - React UI in Keystone Platform for full visibility and control of all scheduled services
 
 ## Phase Details
@@ -47,8 +47,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Read endpoints: list all schedules with computed health status, execution history with pagination and filtering, aggregate health summary (API-01, API-02, API-05)
-- [ ] 02-02-PLAN.md — Write endpoints: schedule CRUD (create, update, soft-delete) with validation, manual trigger using existing scheduler infrastructure (API-03, API-04)
+- [x] 02-01-PLAN.md — Read endpoints: list all schedules with computed health status, execution history with pagination and filtering, aggregate health summary (API-01, API-02, API-05)
+- [x] 02-02-PLAN.md — Write endpoints: schedule CRUD (create, update, soft-delete) with validation, manual trigger using existing scheduler infrastructure (API-03, API-04)
 
 ### Phase 3: Keystone Dashboard
 **Goal**: Developers can see every scheduled service's status, history, and health at a glance, and can create, edit, trigger, or disable any service from the UI without touching SQL directly
@@ -76,5 +76,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Scheduler Reliability | 2/2 | Complete    | 2026-02-28 |
-| 2. API Layer | 0/2 | Not started | - |
+| 2. API Layer | 2/2 | Complete    | 2026-02-28 |
 | 3. Keystone Dashboard | 0/3 | Not started | - |

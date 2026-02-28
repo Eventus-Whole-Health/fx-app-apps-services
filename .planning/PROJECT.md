@@ -26,16 +26,22 @@ Every scheduled service execution is visible, recoverable, and controllable — 
 - ✓ Self-healing — stuck/failed services automatically retry with configurable backoff and max retries — Phase 1
 - ✓ Proper status lifecycle — rows transition pending -> running -> success/failed/timeout — Phase 1
 - ✓ Stuck row detection — watchdog identifies rows running too long, marks them timed out — Phase 1
+- ✓ List schedules API — returns all schedules with computed health status (healthy/degraded/failing) and next run time — Phase 2
+- ✓ Execution history API — paginated history per service, filterable by status and date range, with error details and payloads — Phase 2
+- ✓ Schedule CRUD API — create, update, soft-delete schedules with validation (frequency, trigger_url, function_app, service, schedule_config) — Phase 2
+- ✓ Manual trigger API — trigger any service on demand, await full execution, return log_id and status_url — Phase 2
+- ✓ Health summary API — aggregate healthy/degraded/failing counts for dashboard header — Phase 2
 
 ### Active
 
 <!-- Current scope. Building toward these. -->
 
 - [ ] Keystone dashboard — view all 43+ scheduled services with status, last run, next run, history
-- [ ] Schedule CRUD — create, edit, enable/disable, delete schedules from the UI
-- [ ] Execution history — drill into any service's past runs with timing, status, error details, request/response
-- [ ] Manual trigger from UI — trigger any service on demand from the dashboard
+- [ ] Schedule CRUD UI — create, edit, enable/disable, delete schedules from the Keystone dashboard
+- [ ] Execution history UI — drill into any service's past runs with timing, status, error details, request/response
+- [ ] Manual trigger from UI — trigger any service on demand from the dashboard with real-time status feedback
 - [ ] Service health indicators — at-a-glance red/yellow/green for each service based on recent execution history
+- [ ] Filtering and sorting — by function app, status, frequency, last run time
 
 ### Out of Scope
 
@@ -73,6 +79,11 @@ Every scheduled service execution is visible, recoverable, and controllable — 
 | Two-step SELECT + batch UPDATE for watchdog | SQL Executor API may not support OUTPUT with UPDATE; two-step avoids compatibility issues | Phase 1 |
 | Retry logic in both failure and exception handlers | Exceptions (network errors, timeouts) deserve retry just like HTTP failures | Phase 1 |
 | Exponential backoff capped at 120 minutes | Prevents excessive delay while giving services meaningful retry windows | Phase 1 |
+| CTE with ROW_NUMBER() for health computation | Efficient N+1-free query — computes health per service in a single SQL round trip | Phase 2 |
+| next_run_time computed in Python per-service | SQL date arithmetic across frequencies (hourly/daily/weekly/monthly/once) is unwieldy; Python datetime handles it cleanly | Phase 2 |
+| Option C for manual trigger — await full execution | Keystone ASP has unlimited timeout; scheduler creates its own log entries, so awaiting gives definitive result without double-logging | Phase 2 |
+| Soft-delete only — no hard DELETE on scheduling table | Preserves audit trail; DELETE sets is_active=0 | Phase 2 |
+| System-managed fields blocked from API update | SYSTEM_MANAGED_FIELDS constant prevents callers from corrupting scheduler state (status, log_id, retry_count, etc.) | Phase 2 |
 
 ---
-*Last updated: 2026-02-27 after Phase 1*
+*Last updated: 2026-02-27 after Phase 2*

@@ -24,11 +24,11 @@
 
 ### API Layer
 
-- [ ] **API-01**: List schedules endpoint — returns all schedules with computed health status and next run time
-- [ ] **API-02**: Execution history endpoint — paginated history for a specific service with filter by status/date range
-- [ ] **API-03**: Schedule CRUD endpoints — create, update, delete schedule definitions with validation
-- [ ] **API-04**: Manual trigger endpoint — trigger a specific service and return execution tracking ID
-- [ ] **API-05**: Health summary endpoint — aggregate health across all services for dashboard header stats
+- [x] **API-01**: List schedules endpoint — returns all schedules with computed health status and next run time
+- [x] **API-02**: Execution history endpoint — paginated history for a specific service with filter by status/date range
+- [x] **API-03**: Schedule CRUD endpoints — create, update, delete schedule definitions with validation
+- [x] **API-04**: Manual trigger endpoint — trigger a specific service and return execution tracking ID
+- [x] **API-05**: Health summary endpoint — aggregate health across all services for dashboard header stats
 
 ## v2 Requirements
 
@@ -69,11 +69,11 @@
 | DASH-04 | Phase 3 | Pending |
 | DASH-05 | Phase 3 | Pending |
 | DASH-06 | Phase 3 | Pending |
-| API-01 | Phase 2 | Pending |
-| API-02 | Phase 2 | Pending |
-| API-03 | Phase 2 | Pending |
-| API-04 | Phase 2 | Pending |
-| API-05 | Phase 2 | Pending |
+| API-01 | Phase 2 | Complete |
+| API-02 | Phase 2 | Complete |
+| API-03 | Phase 2 | Complete |
+| API-04 | Phase 2 | Complete |
+| API-05 | Phase 2 | Complete |
 
 **Coverage:**
 - v1 requirements: 16 total
@@ -82,4 +82,4 @@
 
 ---
 *Requirements defined: 2026-02-27*
-*Last updated: 2026-02-27 after roadmap creation — all 16 requirements mapped*
+*Last updated: 2026-02-27 after Phase 2 completion — 10/16 requirements complete*
