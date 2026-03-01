@@ -65,7 +65,7 @@ Plans:
 
 Plans:
 - [x] 03-01-PLAN.md — Foundation + service overview: backend proxy routes, frontend API service with types, card grid grouped by function app, health badges, sub-grid with sorting, sidebar navigation (DASH-01, DASH-02, DASH-06)
-- [ ] 03-02-PLAN.md — Execution history drawer: right-side slide panel with run history, expandable run details, JSON tree viewer for request/response payloads, pagination (DASH-03)
+- [x] 03-02-PLAN.md — Execution history drawer: right-side slide panel with run history, expandable run details, JSON tree viewer for request/response payloads, pagination (DASH-03)
 - [ ] 03-03-PLAN.md — Schedule CRUD and manual trigger: create/edit form drawer, enable/disable inline toggle, delete with confirmation, trigger button with inline spinner and live status polling (DASH-04, DASH-05)
 
 ## Progress
@@ -77,4 +77,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Scheduler Reliability | 2/2 | Complete    | 2026-02-28 |
 | 2. API Layer | 2/2 | Complete    | 2026-02-28 |
-| 3. Keystone Dashboard | 1/3 | In Progress | - |
+| 3. Keystone Dashboard | 2/3 | In Progress | - |
