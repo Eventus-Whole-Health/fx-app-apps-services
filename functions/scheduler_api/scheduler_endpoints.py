@@ -309,6 +309,8 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
                     s.max_execution_minutes,
                     s.error_message,
                     s.log_id,
+                    s.last_response_code,
+                    s.last_response_detail,
                     COALESCE(h.failure_count, 0) as failure_count,
                     COALESCE(h.total_recent, 0) as total_recent
                 FROM jgilpatrick.apps_central_scheduling s
@@ -356,6 +358,8 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
                     "trigger_limit": row.get("trigger_limit"),
                     "max_execution_minutes": row.get("max_execution_minutes"),
                     "error_message": row.get("error_message"),
+                    "last_response_code": row.get("last_response_code"),
+                    "last_response_detail": row.get("last_response_detail"),
                 }
                 services.append(service_data)
 
