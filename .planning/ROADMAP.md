@@ -61,12 +61,12 @@ Plans:
   4. A developer can create a new schedule, edit an existing one, enable/disable it, or delete it entirely from the UI without writing SQL
   5. A developer can trigger any service on demand from the dashboard and see the execution status update in real time
   6. The service list can be filtered by function app, status, and frequency, and sorted by last run time
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 03-01: Service overview and health indicators — list view, health badges, filtering and sorting
-- [ ] 03-02: Execution history and detail panels — drill-down view with full run history
-- [ ] 03-03: Schedule CRUD and manual trigger — create/edit forms, enable/disable toggle, trigger button with live status
+- [ ] 03-01-PLAN.md — Foundation + service overview: backend proxy routes, frontend API service with types, card grid grouped by function app, health badges, sub-grid with sorting, sidebar navigation (DASH-01, DASH-02, DASH-06)
+- [ ] 03-02-PLAN.md — Execution history drawer: right-side slide panel with run history, expandable run details, JSON tree viewer for request/response payloads, pagination (DASH-03)
+- [ ] 03-03-PLAN.md — Schedule CRUD and manual trigger: create/edit form drawer, enable/disable inline toggle, delete with confirmation, trigger button with inline spinner and live status polling (DASH-04, DASH-05)
 
 ## Progress
 
