@@ -138,6 +138,59 @@ def sanitize_sql_string(value: str, max_length: int = 3900) -> str:
     return sanitized
 
 
+async def log_execution(
+    sql_client: SQLClient,
+    schedule_id: int,
+    function_app: str,
+    service_name: str,
+    triggered_at: datetime,
+    status: str,
+    http_status_code: int | None = None,
+    request_payload: str | None = None,
+    response_detail: str | None = None,
+    error_message: str | None = None,
+    trigger_source: str | None = None,
+    log_id: int | None = None,
+    retry_attempt: int = 0,
+) -> None:
+    """Insert a row into apps_scheduler_execution_log."""
+    try:
+        eastern = pytz.timezone("US/Eastern")
+        completed_at = datetime.now(eastern)
+        duration_ms = int((completed_at - triggered_at).total_seconds() * 1000)
+
+        # Build SQL values
+        fa = sanitize_sql_string(function_app)
+        sn = sanitize_sql_string(service_name)
+        stat = sanitize_sql_string(status)
+        ts = sanitize_sql_string(trigger_source or "")
+        req_payload = f"'{sanitize_sql_string(request_payload)}'" if request_payload else "NULL"
+        resp_detail = f"'{sanitize_sql_string(response_detail)}'" if response_detail else "NULL"
+        err_msg = f"'{sanitize_sql_string(error_message)}'" if error_message else "NULL"
+        http_code = str(http_status_code) if http_status_code is not None else "NULL"
+        lid = str(log_id) if log_id is not None else "NULL"
+        ts_val = f"'{ts}'" if trigger_source else "NULL"
+
+        insert_sql = f"""
+            INSERT INTO jgilpatrick.apps_scheduler_execution_log
+                (schedule_id, function_app, service_name, triggered_at, completed_at,
+                 duration_ms, status, http_status_code, request_payload, response_detail,
+                 error_message, trigger_source, log_id, retry_attempt)
+            VALUES
+                ({schedule_id}, '{fa}', '{sn}',
+                 '{triggered_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
+                 '{completed_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
+                 {duration_ms}, '{stat}', {http_code}, {req_payload}, {resp_detail},
+                 {err_msg}, {ts_val}, {lid}, {retry_attempt})
+        """
+        await execute_sql_with_cold_start_retry(
+            sql_client, insert_sql, method="execute",
+            title=f"Log execution for schedule {schedule_id} ({status})"
+        )
+    except Exception as e:
+        LOGGER.error(f"Failed to log execution for schedule {schedule_id}: {e}")
+
+
 def calculate_next_retry_at(retry_count: int, base_delay_minutes: int = RETRY_BASE_DELAY_MINUTES) -> str:
     """
     Calculate the next retry time using exponential backoff.
@@ -457,6 +510,11 @@ async def process_scheduled_services_with_overrides(
                         "service": service_name
                     })
 
+                    # Capture triggered_at for execution log
+                    eastern = pytz.timezone('US/Eastern')
+                    exec_triggered_at = datetime.now(eastern)
+                    trigger_src = getattr(master_logger, 'trigger_source', 'timer') if master_logger else 'timer'
+
                     # Execute the service
                     success, response_code, response_detail, log_id = await execute_service_request(
                         service, current_time, master_logger
@@ -506,7 +564,19 @@ async def process_scheduled_services_with_overrides(
                             "response_code": response_code,
                             "log_id": log_id
                         })
-                        
+
+                        # Log to execution history table
+                        await log_execution(
+                            sql_client, schedule_id=service_id,
+                            function_app=function_app, service_name=service_name,
+                            triggered_at=exec_triggered_at, status="success",
+                            http_status_code=response_code,
+                            request_payload=service.get("json_body"),
+                            response_detail=response_detail,
+                            trigger_source=trigger_src, log_id=log_id,
+                            retry_attempt=service.get("retry_count") or 0,
+                        )
+
                     else:
                         # Handle failure - no retries to prevent duplicate email sends
                         await handle_service_failure(sql_client, service, current_time, response_code, response_detail, log_id)
@@ -515,15 +585,40 @@ async def process_scheduled_services_with_overrides(
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}, log_id: {log_id}): {response_detail[:200]}...")
                         else:
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}): {response_detail[:200]}...")
-                        
+
+                        # Log to execution history table
+                        fail_status = "timeout" if response_code == 408 else "failed"
+                        await log_execution(
+                            sql_client, schedule_id=service_id,
+                            function_app=function_app, service_name=service_name,
+                            triggered_at=exec_triggered_at, status=fail_status,
+                            http_status_code=response_code,
+                            request_payload=service.get("json_body"),
+                            response_detail=response_detail,
+                            error_message=response_detail[:2000] if response_detail else None,
+                            trigger_source=trigger_src, log_id=log_id,
+                            retry_attempt=service.get("retry_count") or 0,
+                        )
+
                 except Exception as e:
                     error_msg = str(e)
                     results["failed"] += 1
                     results["errors"].append(f"Service {service_id} ({function_app}/{service_name}): {error_msg}")
-                    
+
                     # Mark service as failed
                     await handle_service_exception(sql_client, service, error_msg)
-                    
+
+                    # Log to execution history table
+                    await log_execution(
+                        sql_client, schedule_id=service_id,
+                        function_app=function_app, service_name=service_name,
+                        triggered_at=exec_triggered_at, status="error",
+                        request_payload=service.get("json_body"),
+                        error_message=error_msg[:2000],
+                        trigger_source=trigger_src,
+                        retry_attempt=service.get("retry_count") or 0,
+                    )
+
                     LOGGER.error(f"      💥 Service {service_id} exception: {error_msg}")
                     await track_exception(e, {
                         "service_id": service_id,

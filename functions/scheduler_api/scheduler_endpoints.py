@@ -265,28 +265,27 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
     async with SQLClient() as sql:
         try:
             # Single query with CTE to get services + health data efficiently
+            # Uses apps_scheduler_execution_log keyed by schedule_id (no naming mismatch)
             query = """
                 WITH recent_logs AS (
                     SELECT
-                        function_app,
-                        service_name,
+                        schedule_id,
                         status,
                         ROW_NUMBER() OVER (
-                            PARTITION BY function_app, service_name
-                            ORDER BY started_at DESC
+                            PARTITION BY schedule_id
+                            ORDER BY triggered_at DESC
                         ) as rn
-                    FROM jgilpatrick.apps_master_services_log
-                    WHERE started_at >= DATEADD(day, -7, GETDATE())
+                    FROM jgilpatrick.apps_scheduler_execution_log
+                    WHERE triggered_at >= DATEADD(day, -7, GETDATE())
                 ),
                 health_summary AS (
                     SELECT
-                        function_app,
-                        service_name,
+                        schedule_id,
                         COUNT(*) as total_recent,
                         SUM(CASE WHEN status IN ('failed', 'error', 'timeout') THEN 1 ELSE 0 END) as failure_count
                     FROM recent_logs
                     WHERE rn <= 5
-                    GROUP BY function_app, service_name
+                    GROUP BY schedule_id
                 )
                 SELECT
                     s.id,
@@ -315,8 +314,7 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
                     COALESCE(h.total_recent, 0) as total_recent
                 FROM jgilpatrick.apps_central_scheduling s
                 LEFT JOIN health_summary h
-                    ON s.function_app = h.function_app
-                    AND s.service = h.service_name
+                    ON s.id = h.schedule_id
                 WHERE s.is_active = 1
                 ORDER BY s.function_app, s.service
             """
@@ -418,28 +416,27 @@ async def scheduler_health_summary(req: func.HttpRequest) -> func.HttpResponse:
     async with SQLClient() as sql:
         try:
             # Same CTE pattern as list endpoint but only need aggregate counts
+            # Uses apps_scheduler_execution_log keyed by schedule_id (no naming mismatch)
             query = """
                 WITH recent_logs AS (
                     SELECT
-                        function_app,
-                        service_name,
+                        schedule_id,
                         status,
                         ROW_NUMBER() OVER (
-                            PARTITION BY function_app, service_name
-                            ORDER BY started_at DESC
+                            PARTITION BY schedule_id
+                            ORDER BY triggered_at DESC
                         ) as rn
-                    FROM jgilpatrick.apps_master_services_log
-                    WHERE started_at >= DATEADD(day, -7, GETDATE())
+                    FROM jgilpatrick.apps_scheduler_execution_log
+                    WHERE triggered_at >= DATEADD(day, -7, GETDATE())
                 ),
                 health_summary AS (
                     SELECT
-                        function_app,
-                        service_name,
+                        schedule_id,
                         COUNT(*) as total_recent,
                         SUM(CASE WHEN status IN ('failed', 'error', 'timeout') THEN 1 ELSE 0 END) as failure_count
                     FROM recent_logs
                     WHERE rn <= 5
-                    GROUP BY function_app, service_name
+                    GROUP BY schedule_id
                 )
                 SELECT
                     s.id,
@@ -452,8 +449,7 @@ async def scheduler_health_summary(req: func.HttpRequest) -> func.HttpResponse:
                     COALESCE(h.total_recent, 0) as total_recent
                 FROM jgilpatrick.apps_central_scheduling s
                 LEFT JOIN health_summary h
-                    ON s.function_app = h.function_app
-                    AND s.service = h.service_name
+                    ON s.id = h.schedule_id
                 WHERE s.is_active = 1
             """
 
@@ -609,7 +605,7 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
 
     async with SQLClient() as sql:
         try:
-            # Look up the service to get function_app and service name
+            # Look up the service to get function_app and service name for response metadata
             service_query = f"""
                 SELECT id, function_app, service
                 FROM jgilpatrick.apps_central_scheduling
@@ -625,13 +621,10 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
                 )
 
             service_row = service_result[0]
-            function_app = sanitize_sql_string(service_row["function_app"])
-            service_name = sanitize_sql_string(service_row["service"])
 
-            # Build WHERE clause filters
+            # Build WHERE clause — query by schedule_id (no naming mismatch)
             where_clauses = [
-                f"function_app = '{function_app}'",
-                f"service_name = '{service_name}'",
+                f"schedule_id = {service_id_int}",
             ]
 
             if status_filter_value:
@@ -640,11 +633,11 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
 
             if start_date:
                 safe_start = sanitize_sql_string(start_date)
-                where_clauses.append(f"started_at >= '{safe_start}'")
+                where_clauses.append(f"triggered_at >= '{safe_start}'")
 
             if end_date:
                 safe_end = sanitize_sql_string(end_date)
-                where_clauses.append(f"started_at <= '{safe_end}'")
+                where_clauses.append(f"triggered_at <= '{safe_end}'")
 
             where_sql = " AND ".join(where_clauses)
             offset = (page - 1) * page_size
@@ -652,29 +645,33 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
             # Count total matching rows
             count_query = f"""
                 SELECT COUNT(*) as total
-                FROM jgilpatrick.apps_master_services_log
+                FROM jgilpatrick.apps_scheduler_execution_log
                 WHERE {where_sql}
             """
             count_result = await sql.execute(count_query, method="query", title=f"Count history for service {service_id_int}")
             total = count_result[0]["total"] if count_result else 0
 
-            # Fetch paginated results
+            # Fetch paginated results from the new execution log table
             history_query = f"""
                 SELECT
-                    log_id,
+                    execution_id,
+                    schedule_id,
                     function_app,
                     service_name,
                     status,
-                    started_at,
-                    ended_at,
+                    triggered_at,
+                    completed_at,
                     duration_ms,
+                    http_status_code,
+                    request_payload,
+                    response_detail,
                     error_message,
-                    request,
-                    response,
-                    trigger_source
-                FROM jgilpatrick.apps_master_services_log
+                    trigger_source,
+                    log_id,
+                    retry_attempt
+                FROM jgilpatrick.apps_scheduler_execution_log
                 WHERE {where_sql}
-                ORDER BY started_at DESC
+                ORDER BY triggered_at DESC
                 OFFSET {offset} ROWS
                 FETCH NEXT {page_size} ROWS ONLY
             """
@@ -688,30 +685,31 @@ async def get_service_history(req: func.HttpRequest) -> func.HttpResponse:
             for row in history_result:
                 # Parse request data
                 request_data = None
-                if row.get("request"):
+                if row.get("request_payload"):
                     try:
-                        request_data = json.loads(row["request"])
+                        request_data = json.loads(row["request_payload"])
                     except (json.JSONDecodeError, TypeError):
-                        request_data = row["request"]
+                        request_data = row["request_payload"]
 
                 # Parse response data
                 response_data = None
-                if row.get("response"):
+                if row.get("response_detail"):
                     try:
-                        response_data = json.loads(row["response"])
+                        response_data = json.loads(row["response_detail"])
                     except (json.JSONDecodeError, TypeError):
-                        response_data = row["response"]
+                        response_data = row["response_detail"]
 
                 executions.append({
-                    "log_id": row.get("log_id"),
+                    "log_id": row.get("execution_id"),
                     "status": row.get("status"),
-                    "started_at": row.get("started_at"),
-                    "ended_at": row.get("ended_at"),
+                    "started_at": row.get("triggered_at"),
+                    "ended_at": row.get("completed_at"),
                     "duration_ms": row.get("duration_ms"),
                     "error_message": row.get("error_message"),
-                    "request": request_data,
-                    "response": response_data,
+                    "request_data": request_data,
+                    "response_data": response_data,
                     "trigger_source": row.get("trigger_source"),
+                    "http_status_code": row.get("http_status_code"),
                 })
 
             total_pages = math.ceil(total / page_size) if total > 0 else 0
