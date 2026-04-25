@@ -8,3 +8,4 @@ pydantic-settings
 opencensus-ext-azure
 pytz
 seqlog>=0.3.28
+redis>=5.0.0

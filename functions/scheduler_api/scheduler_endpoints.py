@@ -1285,7 +1285,8 @@ async def trigger_service(req: func.HttpRequest) -> func.HttpResponse:
     try:
         # Trigger the service using existing infrastructure
         # bypass_window_check=True means run now regardless of schedule window
-        result = await process_scheduled_services_with_overrides(
+        # process_scheduled_services_with_overrides returns (results_dict, TimeoutTracker)
+        result, _timeout_tracker = await process_scheduled_services_with_overrides(
             force_service_ids=[service_id_int],
             bypass_window_check=True,
         )

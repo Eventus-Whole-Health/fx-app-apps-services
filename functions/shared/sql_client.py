@@ -1,4 +1,4 @@
-"""SQL Services API client for apps-services."""
+"""SQL Services API client for fx-app-apps-services."""
 from __future__ import annotations
 
 import logging

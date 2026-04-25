@@ -227,7 +227,7 @@ def configure_seq_logging() -> bool:
         app_version = os.getenv("APP_VERSION", "1.0.0")
         environment = os.getenv("ENVIRONMENT", "development")
         region = os.getenv("AZURE_REGION", "eastus2")
-        app_name = os.getenv("APP_NAME", "apps-services")
+        app_name = os.getenv("APP_NAME", "fx-app-apps-services")
 
         # Set global properties that will be added to ALL log entries in SEQ
         seqlog.set_global_log_properties(
@@ -286,7 +286,7 @@ def get_base_properties(
         Dict containing standardized base properties
     """
     props = {
-        "AppName": os.getenv("APP_NAME", "apps-services"),
+        "AppName": os.getenv("APP_NAME", "fx-app-apps-services"),
         "FunctionName": context.function_name,
         "AppVersion": os.getenv("APP_VERSION", "1.0.0"),
         "Environment": os.getenv("ENVIRONMENT", "development"),

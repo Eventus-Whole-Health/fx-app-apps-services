@@ -1,22 +1,32 @@
 {
   "version": "2.0",
   "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 5
+      }
+    },
     "logLevel": {
       "default": "Information",
       "Host.Results": "Information",
       "Function": "Information",
-      "Host.Aggregator": "Information"
-    },
-    "applicationInsights": {
-      "samplingSettings": {
-        "isEnabled": true,
-        "maxTelemetryItemsPerSecond": 20
-      }
+      "Host.Aggregator": "Information",
+      "Microsoft.AspNetCore.Authentication": "Warning",
+      "Microsoft.AspNetCore.Authorization": "Warning",
+      "Microsoft.Azure.WebJobs.Host": "Information"
     }
   },
-  "functionTimeout": "-1",
   "extensionBundle": {
     "id": "Microsoft.Azure.Functions.ExtensionBundle",
-    "version": "[4.*, 5.0.0)"
-  }
+    "version": "[4.0.0, 5.0.0)"
+  },
+  "healthMonitor": {
+    "enabled": true,
+    "healthCheckInterval": "00:00:10",
+    "healthCheckWindow": "00:02:00",
+    "healthCheckThreshold": 6,
+    "counterThreshold": 0.8
+  },
+  "functionTimeout": "00:10:00"
 }

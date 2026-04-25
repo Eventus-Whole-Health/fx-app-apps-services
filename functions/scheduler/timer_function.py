@@ -15,18 +15,40 @@ import httpx
 from ..shared.settings import get_settings
 from ..shared.sql_client import SQLClient
 from ..shared.telemetry import track_event, track_exception
-from ..shared.service_logger import ServiceLogger
+from ..shared.master_service_logger import MasterServiceLogger
 
 LOGGER = logging.getLogger(__name__)
 
 # Constants for timeout and retry handling
-SERVICE_REQUEST_TIMEOUT = 600  # 10 minutes timeout per service request (increased for unlimited timeout support)
+FUNCTION_TIMEOUT_SECONDS = 540  # 9 minutes - leave 1 minute buffer before Azure timeout
+SERVICE_REQUEST_TIMEOUT = 300  # 5 minutes timeout per service request (increased from 2 min to handle long-running services)
 SQL_COLD_START_RETRY_DELAY = 5  # Wait 5 seconds before retrying SQL operations
 MAX_SQL_COLD_START_RETRIES = 3  # Maximum retries for SQL cold starts
 POLLING_INTERVAL = 30  # Poll every 30 seconds for 202 responses
-DEFAULT_MAX_EXECUTION_MINUTES = 30  # Default threshold for stuck service detection
-MAX_POLLING_DURATION = 3300  # 55 minutes max polling (leaves 5 min buffer before next timer)
-RETRY_BASE_DELAY_MINUTES = 2  # Base delay for exponential backoff (2 min, 4 min, 8 min, 16 min, ...)
+MAX_POLLING_TIME = 480  # Poll for up to 8 minutes (leaving 1 minute buffer)
+
+
+class TimeoutTracker:
+    """Track function execution time to prevent Azure Function timeout."""
+    
+    def __init__(self, timeout_seconds: int = FUNCTION_TIMEOUT_SECONDS):
+        self.start_time = time.time()
+        self.timeout_seconds = timeout_seconds
+        self.timeout_reached = False
+    
+    def is_timeout_approaching(self, buffer_seconds: int = 30) -> bool:
+        """Check if we're approaching timeout with given buffer."""
+        elapsed = time.time() - self.start_time
+        return elapsed >= (self.timeout_seconds - buffer_seconds)
+    
+    def get_remaining_time(self) -> float:
+        """Get remaining time in seconds."""
+        elapsed = time.time() - self.start_time
+        return max(0, self.timeout_seconds - elapsed)
+    
+    def mark_timeout_reached(self) -> None:
+        """Mark that timeout has been reached."""
+        self.timeout_reached = True
 
 
 def get_eastern_time_sql() -> str:
@@ -138,72 +160,6 @@ def sanitize_sql_string(value: str, max_length: int = 3900) -> str:
     return sanitized
 
 
-async def log_execution(
-    sql_client: SQLClient,
-    schedule_id: int,
-    function_app: str,
-    service_name: str,
-    triggered_at: datetime,
-    status: str,
-    http_status_code: int | None = None,
-    request_payload: str | None = None,
-    response_detail: str | None = None,
-    error_message: str | None = None,
-    trigger_source: str | None = None,
-    log_id: int | None = None,
-    retry_attempt: int = 0,
-) -> None:
-    """Insert a row into apps_scheduler_execution_log."""
-    try:
-        eastern = pytz.timezone("US/Eastern")
-        completed_at = datetime.now(eastern)
-        duration_ms = int((completed_at - triggered_at).total_seconds() * 1000)
-
-        # Build SQL values
-        fa = sanitize_sql_string(function_app)
-        sn = sanitize_sql_string(service_name)
-        stat = sanitize_sql_string(status)
-        ts = sanitize_sql_string(trigger_source or "")
-        req_payload = f"'{sanitize_sql_string(request_payload)}'" if request_payload else "NULL"
-        resp_detail = f"'{sanitize_sql_string(response_detail)}'" if response_detail else "NULL"
-        err_msg = f"'{sanitize_sql_string(error_message)}'" if error_message else "NULL"
-        http_code = str(http_status_code) if http_status_code is not None else "NULL"
-        lid = str(log_id) if log_id is not None else "NULL"
-        ts_val = f"'{ts}'" if trigger_source else "NULL"
-
-        insert_sql = f"""
-            INSERT INTO jgilpatrick.apps_scheduler_execution_log
-                (schedule_id, function_app, service_name, triggered_at, completed_at,
-                 duration_ms, status, http_status_code, request_payload, response_detail,
-                 error_message, trigger_source, log_id, retry_attempt)
-            VALUES
-                ({schedule_id}, '{fa}', '{sn}',
-                 '{triggered_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
-                 '{completed_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
-                 {duration_ms}, '{stat}', {http_code}, {req_payload}, {resp_detail},
-                 {err_msg}, {ts_val}, {lid}, {retry_attempt})
-        """
-        await execute_sql_with_cold_start_retry(
-            sql_client, insert_sql, method="execute",
-            title=f"Log execution for schedule {schedule_id} ({status})"
-        )
-    except Exception as e:
-        LOGGER.error(f"Failed to log execution for schedule {schedule_id}: {e}")
-
-
-def calculate_next_retry_at(retry_count: int, base_delay_minutes: int = RETRY_BASE_DELAY_MINUTES) -> str:
-    """
-    Calculate the next retry time using exponential backoff.
-    Returns a SQL expression for the next retry datetime in Eastern time.
-
-    Backoff schedule: 2min, 4min, 8min, 16min, 32min, 64min, ...
-    Capped at 120 minutes (2 hours) to prevent excessive delay.
-    """
-    delay_minutes = min(base_delay_minutes * (2 ** retry_count), 120)
-    eastern_time_sql = get_eastern_time_sql()
-    return f"DATEADD(minute, {delay_minutes}, {eastern_time_sql})"
-
-
 def is_within_schedule_window(current_time: datetime, scheduled_time_str: str, window_minutes: int = 15) -> bool:
     """
     Check if current time is within the scheduled time window.
@@ -220,122 +176,138 @@ def is_within_schedule_window(current_time: datetime, scheduled_time_str: str, w
     try:
         # Parse scheduled time
         hour, minute = map(int, scheduled_time_str.split(':'))
-
-        # Validate range — reject malformed values like "24:00" or "12:60"
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            return False
-
+        
         # Check if current hour matches
         if current_time.hour != hour:
             return False
-
+        
         # Check if we're within the same 15-minute window
         # Windows are: 00-14, 15-29, 30-44, 45-59
         current_window = current_time.minute // window_minutes
         scheduled_window = minute // window_minutes
-
+        
         return current_window == scheduled_window
     except (ValueError, AttributeError):
         return False
 
 
-async def process_scheduled_services() -> Dict[str, Any]:
+async def process_scheduled_services() -> tuple[Dict[str, Any], TimeoutTracker]:
     """Process all scheduled services that are due for execution."""
     return await process_scheduled_services_with_overrides()
 
 
 async def check_and_handle_stuck_processing_services(sql_client: SQLClient, current_time: datetime) -> int:
     """
-    Check for services stuck in 'processing' status beyond their configured threshold
-    and mark them as failed.
-
-    Uses max_execution_minutes from apps_central_scheduling (defaults to 30 if NULL).
-
+    Check for services stuck in 'processing' status for more than 15 minutes or with NULL last_triggered_at and mark them as failed.
+    
     Args:
         sql_client: SQL client instance
         current_time: Current datetime in Eastern timezone
-
+    
     Returns:
         Number of stuck services found and marked as failed
     """
     eastern_time_sql = get_eastern_time_sql()
-
-    # Step 1: Find stuck services (for logging)
-    stuck_query = f"""
-        SELECT id, function_app, service
+    
+    # Query for services stuck in processing status for more than 15 minutes OR with NULL last_triggered_at
+    stuck_services_sql = f"""
+        SELECT id, function_app, service, last_triggered_at, retry_count, max_retries
         FROM jgilpatrick.apps_central_scheduling
         WHERE status = 'processing'
         AND (
             last_triggered_at IS NULL
-            OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > COALESCE(max_execution_minutes, {DEFAULT_MAX_EXECUTION_MINUTES})
+            OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > 15
         )
     """
 
     try:
         stuck_services = await execute_sql_with_cold_start_retry(
             sql_client,
-            stuck_query,
+            stuck_services_sql,
             method="query",
-            title="Watchdog: find stuck processing services"
+            title="Check for stuck processing services"
         )
 
-        if not stuck_services or not isinstance(stuck_services, list) or len(stuck_services) == 0:
+        if not stuck_services or not isinstance(stuck_services, list):
             return 0
 
         stuck_count = len(stuck_services)
-        LOGGER.warning(f"Watchdog: found {stuck_count} stuck services exceeding max execution time")
+        if stuck_count > 0:
+            LOGGER.warning(f"Found {stuck_count} services stuck in 'processing' status (>15 minutes or NULL last_triggered_at)")
 
-        # Log each stuck service with structured Seq event
-        for svc in stuck_services:
-            LOGGER.warning(
-                f"Watchdog: service {svc['id']} ({svc['function_app']}/{svc['service']}) exceeded threshold",
-                extra={
-                    "EventType": "WatchdogTimeout",
-                    "ServiceId": svc["id"],
-                    "FunctionApp": svc["function_app"],
-                    "Service": svc["service"]
-                }
-            )
+            for service in stuck_services:
+                service_id = service["id"]
+                function_app = service["function_app"]
+                service_name = service["service"]
+                last_triggered = service["last_triggered_at"]
+                retry_count = service.get("retry_count", 0) or 0
+                max_retries = service.get("max_retries", 0) or 0
 
-        # Step 2: Batch UPDATE all stuck services in a single statement (no N+1)
-        stuck_update = f"""
-            UPDATE jgilpatrick.apps_central_scheduling
-            SET status = 'failed',
-                processed_at = {eastern_time_sql},
-                last_response_code = 408,
-                error_message = 'Watchdog: exceeded max execution time'
-            WHERE status = 'processing'
-            AND (
-                last_triggered_at IS NULL
-                OR DATEDIFF(minute, last_triggered_at, {eastern_time_sql}) > COALESCE(max_execution_minutes, {DEFAULT_MAX_EXECUTION_MINUTES})
-            )
-        """
+                if last_triggered is None:
+                    LOGGER.warning(f"   Service {service_id} ({function_app}/{service_name}) stuck with NULL last_triggered_at")
+                    error_message = 'Service execution timeout - stuck in processing status with NULL last_triggered_at'
+                else:
+                    LOGGER.warning(f"   Service {service_id} ({function_app}/{service_name}) stuck since {last_triggered}")
+                    error_message = 'Service execution timeout - stuck in processing status for >15 minutes'
 
-        await execute_sql_with_cold_start_retry(
-            sql_client,
-            stuck_update,
-            method="execute",
-            title="Watchdog: batch mark stuck services as failed"
-        )
+                if max_retries == 0 or retry_count >= max_retries:
+                    # No retries allowed or retries exhausted - mark as permanently failed
+                    await execute_sql_with_cold_start_retry(
+                        sql_client,
+                        f"""
+                        UPDATE jgilpatrick.apps_central_scheduling
+                        SET status = 'failed',
+                            processed_at = {eastern_time_sql},
+                            last_response_code = 408,
+                            last_response_detail = NULL,
+                            error_message = '{error_message}'
+                        WHERE id = {service_id}
+                        """,
+                        method="execute",
+                        title=f"Mark stuck service {service_id} as failed (permanent)"
+                    )
+                else:
+                    # Schedule retry with linear backoff
+                    new_retry_count = retry_count + 1
+                    backoff_minutes = 15 * new_retry_count
+                    next_retry_time = current_time + timedelta(minutes=backoff_minutes)
+                    next_retry_str = next_retry_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        LOGGER.warning(f"Watchdog: marked {stuck_count} stuck services as failed")
+                    await execute_sql_with_cold_start_retry(
+                        sql_client,
+                        f"""
+                        UPDATE jgilpatrick.apps_central_scheduling
+                        SET status = 'pending',
+                            processed_at = {eastern_time_sql},
+                            last_response_code = 408,
+                            last_response_detail = NULL,
+                            error_message = '{error_message} (retry {new_retry_count}/{max_retries})',
+                            retry_count = {new_retry_count},
+                            next_retry_at = '{next_retry_str}'
+                        WHERE id = {service_id}
+                        """,
+                        method="execute",
+                        title=f"Schedule stuck service {service_id} for retry {new_retry_count}/{max_retries}"
+                    )
+                    LOGGER.warning(f"   Stuck service {service_id} scheduling retry {new_retry_count}/{max_retries} at {next_retry_str}")
+
+            LOGGER.warning(f"Processed {stuck_count} stuck services")
+        
         return stuck_count
-
+        
     except Exception as e:
-        LOGGER.error(f"Watchdog error: {str(e)}", extra={
-            "EventType": "WatchdogError",
-            "ErrorMessage": str(e)[:500]
-        })
+        LOGGER.error(f"Error checking for stuck processing services: {str(e)}")
         return 0
 
 
 async def process_scheduled_services_with_overrides(
     bypass_window_check: bool = False,
     force_service_ids: list[int] = None,
-    master_logger: Optional[ServiceLogger] = None
-) -> Dict[str, Any]:
+    master_logger: Optional[MasterServiceLogger] = None
+) -> tuple[Dict[str, Any], TimeoutTracker]:
     """Process all scheduled services that are due for execution with optional overrides."""
     settings = get_settings()
+    timeout_tracker = TimeoutTracker()
     
     # Log authentication environment for debugging
     import os
@@ -378,45 +350,41 @@ async def process_scheduled_services_with_overrides(
                 if bypass_window_check:
                     # Bypass all scheduling conditions - only check is_active
                     fetch_services_sql = f"""
-                        SELECT id, function_app, service, trigger_url, json_body, 
-                               start_date, frequency, schedule_config, 
-                               triggered_count, trigger_limit, last_triggered_at, 
-                               retry_count, max_retries
+                        SELECT id, function_app, service, trigger_url, json_body,
+                               start_date, frequency, schedule_config,
+                               triggered_count, trigger_limit, last_triggered_at,
+                               retry_count, max_retries, next_retry_at
                         FROM jgilpatrick.apps_central_scheduling
-                        WHERE is_active = 1 
+                        WHERE is_active = 1
                         {service_filter}
                         ORDER BY start_date ASC
                     """
                 else:
                     # Normal conditions with service ID filter
-                    eastern_time_sql = get_eastern_time_sql()
                     fetch_services_sql = f"""
                         SELECT id, function_app, service, trigger_url, json_body,
                                start_date, frequency, schedule_config,
                                triggered_count, trigger_limit, last_triggered_at,
-                               retry_count, max_retries
+                               retry_count, max_retries, next_retry_at
                         FROM jgilpatrick.apps_central_scheduling
                         WHERE is_active = 1
                         AND status IN ('pending', 'failed')
                         AND (trigger_limit IS NULL OR triggered_count < trigger_limit)
-                        AND (next_retry_at IS NULL OR next_retry_at <= {eastern_time_sql})
                         {service_filter}
                         ORDER BY start_date ASC
                     """
             else:
                 service_filter = ""
                 # Standard query with normal conditions
-                eastern_time_sql = get_eastern_time_sql()
                 fetch_services_sql = f"""
                     SELECT id, function_app, service, trigger_url, json_body,
                            start_date, frequency, schedule_config,
                            triggered_count, trigger_limit, last_triggered_at,
-                           retry_count, max_retries
+                           retry_count, max_retries, next_retry_at
                     FROM jgilpatrick.apps_central_scheduling
                     WHERE is_active = 1
                     AND status IN ('pending', 'failed')
                     AND (trigger_limit IS NULL OR triggered_count < trigger_limit)
-                    AND (next_retry_at IS NULL OR next_retry_at <= {eastern_time_sql})
                     {service_filter}
                     ORDER BY start_date ASC
                 """
@@ -430,18 +398,24 @@ async def process_scheduled_services_with_overrides(
             
             if not services_response or not isinstance(services_response, list):
                 LOGGER.info("📭 No active services found in database")
-                return results
+                return results, timeout_tracker
             
             services = services_response
             LOGGER.info(f"📋 Found {len(services)} active services to evaluate")
-
+            
             # Log service details
             if services:
                 LOGGER.info(f"📝 Services to evaluate:")
                 for service in services:
                     LOGGER.info(f"   • ID {service['id']}: {service['function_app']}/{service['service']} ({service['frequency']})")
-
+            
             for service in services:
+                # Check if we're approaching timeout before processing each service
+                if timeout_tracker.is_timeout_approaching():
+                    LOGGER.warning(f"Approaching function timeout, stopping processing. Remaining time: {timeout_tracker.get_remaining_time():.1f}s")
+                    timeout_tracker.mark_timeout_reached()
+                    break
+                
                 service_id = service["id"]
                 function_app = service["function_app"]
                 service_name = service["service"]
@@ -490,7 +464,9 @@ async def process_scheduled_services_with_overrides(
                     
                     LOGGER.info(f"      🚀 Executing service {service_id}...")
 
-                    # Mark as processing and set last_triggered_at
+                    # Atomic claim: only mark as processing if still pending/failed.
+                    # OUTPUT without INTO is prohibited when the table has an AFTER UPDATE trigger
+                    # (SQL Error 334), so we split into UPDATE + SELECT instead.
                     eastern_time_sql = get_eastern_time_sql()
                     await execute_sql_with_cold_start_retry(
                         sql_client,
@@ -499,28 +475,46 @@ async def process_scheduled_services_with_overrides(
                         SET status = 'processing',
                             last_triggered_at = {eastern_time_sql}
                         WHERE id = {service_id}
+                        AND status IN ('pending', 'failed')
                         """,
                         method="execute",
-                        title=f"Mark service {service_id} as processing"
+                        title=f"Atomic claim service {service_id} for processing"
                     )
+
+                    claim_result = await execute_sql_with_cold_start_retry(
+                        sql_client,
+                        f"""
+                        SELECT id FROM jgilpatrick.apps_central_scheduling
+                        WHERE id = {service_id}
+                        AND status = 'processing'
+                        AND last_triggered_at = {eastern_time_sql}
+                        """,
+                        method="query",
+                        title=f"Verify claim for service {service_id}"
+                    )
+
+                    if not claim_result or not isinstance(claim_result, list) or len(claim_result) == 0:
+                        LOGGER.warning(f"      🔒 Service {service_id} already claimed by another instance, skipping")
+                        results["skipped"] += 1
+                        continue
 
                     # Track triggered service
                     results["triggered_services"].append({
                         "function_app": function_app,
                         "service": service_name
                     })
-
-                    # Capture triggered_at for execution log
-                    eastern = pytz.timezone('US/Eastern')
-                    exec_triggered_at = datetime.now(eastern)
-                    trigger_src = getattr(master_logger, 'trigger_source', 'timer') if master_logger else 'timer'
-
-                    # Execute the service
-                    success, response_code, response_detail, log_id = await execute_service_request(
-                        service, current_time, master_logger
+                    
+                    # Execute the service with timeout awareness
+                    success, response_code, response_detail, was_timeout, log_id = await execute_service_request_with_timeout(
+                        service, current_time, timeout_tracker, master_logger
                     )
-
-                    if success:
+                    
+                    if was_timeout:
+                        # Handle timeout case
+                        await handle_service_timeout(sql_client, service, current_time)
+                        results["timed_out"] += 1
+                        LOGGER.warning(f"      ⏰ Service {service_id} timed out due to function timeout approaching")
+                    elif success:
                         # Update success counters and timestamps
                         sanitized_detail = sanitize_sql_string(response_detail)
                         next_status = get_next_status(service)
@@ -532,8 +526,8 @@ async def process_scheduled_services_with_overrides(
                         await execute_sql_with_cold_start_retry(
                             sql_client,
                             f"""
-                            UPDATE jgilpatrick.apps_central_scheduling
-                            SET status = '{next_status}',
+                            UPDATE jgilpatrick.apps_central_scheduling 
+                            SET status = '{next_status}', 
                                 triggered_count = triggered_count + 1,
                                 last_triggered_at = {eastern_time_sql},
                                 last_response_code = {response_code},
@@ -564,61 +558,24 @@ async def process_scheduled_services_with_overrides(
                             "response_code": response_code,
                             "log_id": log_id
                         })
-
-                        # Log to execution history table
-                        await log_execution(
-                            sql_client, schedule_id=service_id,
-                            function_app=function_app, service_name=service_name,
-                            triggered_at=exec_triggered_at, status="success",
-                            http_status_code=response_code,
-                            request_payload=service.get("json_body"),
-                            response_detail=response_detail,
-                            trigger_source=trigger_src, log_id=log_id,
-                            retry_attempt=service.get("retry_count") or 0,
-                        )
-
+                        
                     else:
-                        # Handle failure - no retries to prevent duplicate email sends
+                        # Handle failure with retry logic (respects per-service max_retries)
                         await handle_service_failure(sql_client, service, current_time, response_code, response_detail, log_id)
                         results["failed"] += 1
                         if log_id is not None:
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}, log_id: {log_id}): {response_detail[:200]}...")
                         else:
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}): {response_detail[:200]}...")
-
-                        # Log to execution history table
-                        fail_status = "timeout" if response_code == 408 else "failed"
-                        await log_execution(
-                            sql_client, schedule_id=service_id,
-                            function_app=function_app, service_name=service_name,
-                            triggered_at=exec_triggered_at, status=fail_status,
-                            http_status_code=response_code,
-                            request_payload=service.get("json_body"),
-                            response_detail=response_detail,
-                            error_message=response_detail[:2000] if response_detail else None,
-                            trigger_source=trigger_src, log_id=log_id,
-                            retry_attempt=service.get("retry_count") or 0,
-                        )
-
+                        
                 except Exception as e:
                     error_msg = str(e)
                     results["failed"] += 1
                     results["errors"].append(f"Service {service_id} ({function_app}/{service_name}): {error_msg}")
-
+                    
                     # Mark service as failed
                     await handle_service_exception(sql_client, service, error_msg)
-
-                    # Log to execution history table
-                    await log_execution(
-                        sql_client, schedule_id=service_id,
-                        function_app=function_app, service_name=service_name,
-                        triggered_at=exec_triggered_at, status="error",
-                        request_payload=service.get("json_body"),
-                        error_message=error_msg[:2000],
-                        trigger_source=trigger_src,
-                        retry_attempt=service.get("retry_count") or 0,
-                    )
-
+                    
                     LOGGER.error(f"      💥 Service {service_id} exception: {error_msg}")
                     await track_exception(e, {
                         "service_id": service_id,
@@ -631,14 +588,9 @@ async def process_scheduled_services_with_overrides(
             error_msg = f"Error fetching or processing scheduled services: {str(e)}"
             results["errors"].append(error_msg)
             LOGGER.error(error_msg)
-            # Emit structured Seq event for processing failure
-            LOGGER.error(f"Scheduler service processing failed", extra={
-                "EventType": "SchedulerProcessingFailed",
-                "ErrorMessage": str(e)[:500]
-            })
             await track_exception(e, {"operation": "fetch_scheduled_services"})
-
-    return results
+    
+    return results, timeout_tracker
 
 
 async def should_trigger_service(service: Dict[str, Any], current_time: datetime) -> bool:
@@ -648,22 +600,36 @@ async def should_trigger_service(service: Dict[str, Any], current_time: datetime
 
 async def should_trigger_service_bypass_window(service: Dict[str, Any], current_time: datetime, check_window: bool = False) -> bool:
     """Determine if a service should be triggered, optionally bypassing window checks."""
+    # Check retry backoff: if next_retry_at is set and hasn't elapsed, skip this service
+    next_retry_at = service.get("next_retry_at")
+    if next_retry_at:
+        eastern = pytz.timezone('US/Eastern')
+        if isinstance(next_retry_at, str):
+            try:
+                if 'Z' in next_retry_at or '+' in next_retry_at or next_retry_at.count('-') > 2:
+                    utc_time = datetime.fromisoformat(next_retry_at.replace('Z', '+00:00'))
+                    next_retry_at = utc_time.astimezone(eastern)
+                else:
+                    next_retry_at = datetime.fromisoformat(next_retry_at)
+                    next_retry_at = eastern.localize(next_retry_at)
+            except (ValueError, AttributeError):
+                next_retry_at = datetime.fromisoformat(next_retry_at)
+                next_retry_at = eastern.localize(next_retry_at)
+        elif hasattr(next_retry_at, 'tzinfo') and next_retry_at.tzinfo is None:
+            next_retry_at = eastern.localize(next_retry_at)
+
+        if current_time < next_retry_at:
+            LOGGER.info(f"      Service {service['id']} retry backoff not elapsed (next_retry_at: {next_retry_at})")
+            return False
+        # Backoff elapsed — fire the retry regardless of schedule window or same-day dedup
+        LOGGER.info(f"      Service {service['id']} retry ready (next_retry_at: {next_retry_at} elapsed)")
+        return True
+
     frequency = service["frequency"]
     last_triggered = service["last_triggered_at"]
     start_date = service["start_date"]
     schedule_config = service.get("schedule_config")
-
-    LOGGER.debug(f"Service {service['id']}: evaluating {frequency} schedule (last_triggered: {last_triggered}, start_date: {start_date})")
-
-    # Helper for DST-safe localization of naive datetimes
-    def _safe_localize(dt, tz):
-        """Localize a naive datetime, handling DST ambiguous times gracefully."""
-        try:
-            return tz.localize(dt, is_dst=None)
-        except pytz.exceptions.AmbiguousTimeError:
-            # During DST fall-back transition, assume DST (earlier offset)
-            return tz.localize(dt, is_dst=True)
-
+    
     # Parse last triggered time
     # Database stores Eastern time as naive datetime via jgilpatrick.GetEasternTime()
     eastern = pytz.timezone('US/Eastern')
@@ -678,17 +644,17 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
                 else:
                     # No timezone info, assume Eastern (from SQL GetEasternTime)
                     last_triggered = datetime.fromisoformat(last_triggered)
-                    last_triggered = _safe_localize(last_triggered, eastern)
+                    last_triggered = eastern.localize(last_triggered)
             except (ValueError, AttributeError):
                 # Fallback: parse as naive and assume Eastern
                 last_triggered = datetime.fromisoformat(last_triggered)
-                last_triggered = _safe_localize(last_triggered, eastern)
+                last_triggered = eastern.localize(last_triggered)
         elif hasattr(last_triggered, 'tzinfo'):
             if last_triggered.tzinfo is None:
                 # Naive datetime from SQL - assume Eastern time
-                last_triggered = _safe_localize(last_triggered, eastern)
+                last_triggered = eastern.localize(last_triggered)
             # If already timezone-aware, leave as is
-
+    
     # Parse start date
     # Database stores Eastern time as naive datetime via jgilpatrick.GetEasternTime()
     if isinstance(start_date, str):
@@ -700,88 +666,77 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
             else:
                 # No timezone info, assume Eastern (from SQL GetEasternTime)
                 start_date = datetime.fromisoformat(start_date)
-                start_date = _safe_localize(start_date, eastern)
+                start_date = eastern.localize(start_date)
         except (ValueError, AttributeError):
             start_date = datetime.fromisoformat(start_date)
-            start_date = _safe_localize(start_date, eastern)
+            start_date = eastern.localize(start_date)
     elif hasattr(start_date, 'tzinfo'):
         if start_date.tzinfo is None:
             # Naive datetime from SQL - assume Eastern time
-            start_date = _safe_localize(start_date, eastern)
+            start_date = eastern.localize(start_date)
         # If already timezone-aware, leave as is
-
+    
     # Universal activation check - service doesn't run until start_date is reached
     if start_date > current_time:
         return False
-
+    
     if frequency == "once":
         # One-time trigger: check if not already triggered
         # Note: start_date check already done above
         return last_triggered is None
-
+    
     elif frequency == "daily":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 times = config.get("times", ["00:00"])
-
+                
                 # Check if current time is within any configured time windows (if window check enabled)
                 if check_window:
                     matches_time_window = any(
-                        is_within_schedule_window(current_time, time_str)
+                        is_within_schedule_window(current_time, time_str) 
                         for time_str in times
                     )
-
+                    
                     if not matches_time_window:
                         return False
-
+                
                 # Check if already triggered today
                 if last_triggered:
                     return last_triggered.date() < current_time.date()
                 return True
-
+                
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-        else:
-            # No schedule_config: run once per day at any window
-            if last_triggered:
-                return last_triggered.date() < current_time.date()
-            return True
-
+    
     elif frequency == "weekly":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 days = config.get("days", ["monday"])
                 time_str = config.get("time", "00:00")
-
+                
                 # Check if current day matches
                 current_day = current_time.strftime("%A").lower()
                 if current_day not in [day.lower() for day in days]:
                     return False
-
+                
                 # Check if current time is within schedule window (if window check enabled)
                 if check_window and not is_within_schedule_window(current_time, time_str):
                     return False
-
+                
                 # Check if already triggered today (allows multiple days per week)
                 # Services can run on multiple days like Monday AND Friday
                 if last_triggered:
                     # Only skip if already triggered today
                     return last_triggered.date() != current_time.date()
                 return True
-
+                
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-        else:
-            # No schedule_config: run once per week on any day
-            if last_triggered:
-                days_since = (current_time.date() - last_triggered.date()).days
-                return days_since >= 7
-            return True
-
+    
     elif frequency == "hourly":
         if schedule_config:
             try:
@@ -824,69 +779,54 @@ async def should_trigger_service_bypass_window(service: Dict[str, Any], current_
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-        else:
-            # No schedule_config: run once per hour
-            if last_triggered:
-                same_hour = (last_triggered.hour == current_time.hour and
-                             last_triggered.date() == current_time.date())
-                return not same_hour
-            return True
-
+    
     elif frequency == "monthly":
         if schedule_config:
             try:
                 config = json.loads(schedule_config)
                 day = config.get("day", 1)
                 time_str = config.get("time", "00:00")
-
+                
                 # Check if current day of month matches
                 if current_time.day != day:
                     return False
-
+                
                 # Check if current time is within schedule window (if window check enabled)
                 if check_window and not is_within_schedule_window(current_time, time_str):
                     return False
-
+                
                 # Check if already triggered this month
                 if last_triggered:
-                    return (last_triggered.month != current_time.month or
-                            last_triggered.year != current_time.year)
+                    return (last_triggered.month != current_time.month or 
+                           last_triggered.year != current_time.year)
                 return True
-
+                
             except (json.JSONDecodeError, KeyError):
                 LOGGER.warning(f"Invalid schedule_config for service {service['id']}: {schedule_config}")
                 return False
-        else:
-            # No schedule_config: run once per month
-            if last_triggered:
-                return (last_triggered.month != current_time.month or
-                        last_triggered.year != current_time.year)
-            return True
-
+    
     # Default: don't trigger for unknown frequencies
     return False
 
 
-async def poll_master_log_for_completion(log_id: str, max_duration: int = MAX_POLLING_DURATION) -> tuple[bool, int, str]:
+async def poll_master_log_for_completion(log_id: str, timeout_tracker: TimeoutTracker) -> tuple[bool, int, str]:
     """
-    Poll the master services log for the given log_id until completion or max_duration exceeded.
+    Poll the master services log for the given log_id until completion or timeout.
     Returns (success, http_like_code, detail_message).
     """
-    poll_start = time.time()
+    start_polling_time = time.time()
 
     while True:
-        elapsed = time.time() - poll_start
-        if elapsed >= max_duration:
-            LOGGER.error(
-                f"Polling timeout: service log_id {log_id} did not complete within {max_duration}s",
-                extra={
-                    "EventType": "PollingTimeout",
-                    "LogId": log_id,
-                    "ElapsedSeconds": round(elapsed, 1),
-                    "MaxDuration": max_duration
-                }
-            )
-            return False, 408, f"Polling timeout after {int(elapsed)}s — service did not complete"
+        # Ensure we leave buffer before function timeout
+        if timeout_tracker.get_remaining_time() < 60:
+            LOGGER.warning(f"Polling for log_id {log_id} aborted due to function timeout approaching")
+            return False, 408, "Polling timeout - function approaching 9-minute limit"
+
+        # Hard cap polling duration
+        elapsed_polling = time.time() - start_polling_time
+        if elapsed_polling > MAX_POLLING_TIME:
+            LOGGER.warning(f"Polling for log_id {log_id} exceeded {MAX_POLLING_TIME}s")
+            return False, 408, f"Polling exceeded {MAX_POLLING_TIME}s - assuming long-running operation"
 
         try:
             async with SQLClient() as sql_client:
@@ -904,17 +844,17 @@ async def poll_master_log_for_completion(log_id: str, max_duration: int = MAX_PO
                 status_val = (rows[0].get("status") or "").lower()
                 error_msg = rows[0].get("error_message") or ""
 
-                if status_val in ("success", "failed", "warning", "timeout"):
+                if status_val in ("success", "failed", "warning"):
                     if status_val == "success":
                         return True, 200, "Master log status: success"
                     if status_val == "warning":
                         # Treat as non-fatal but not success
                         return False, 200, "Master log status: warning"
-                    # failed or timeout
-                    detail = f"Master log status: {status_val}{(f' - {error_msg}' if error_msg else '')}"
+                    # failed
+                    detail = f"Master log status: failed{(f' - {error_msg}' if error_msg else '')}"
                     return False, 500, detail
 
-            # Not complete yet; wait and continue polling
+            # Not complete yet; wait and continue
             await asyncio.sleep(POLLING_INTERVAL)
             continue
 
@@ -937,79 +877,49 @@ def get_next_status(service: Dict[str, Any]) -> str:
     return "pending"
 
 
-async def handle_service_failure(
-    sql_client: SQLClient,
-    service: Dict[str, Any],
-    current_time: datetime,
-    response_code: int,
-    response_detail: str,
-    log_id: Optional[int] = None
-) -> None:
-    """
-    Handle service execution failure with configurable retry.
-
-    If max_retries > 0 and retry_count < max_retries: schedule retry with exponential backoff.
-    If max_retries == 0 or retries exhausted: mark as failed permanently.
-    """
+async def handle_service_timeout(sql_client: SQLClient, service: Dict[str, Any], current_time: datetime) -> None:
+    """Handle service execution timeout due to function timeout approaching."""
     service_id = service["id"]
-    max_retries = service.get("max_retries") or 0
-    retry_count = service.get("retry_count") or 0
-
-    sanitized_detail = sanitize_sql_string(response_detail)
     eastern_time_sql = get_eastern_time_sql()
-    log_id_value = str(log_id) if log_id is not None else "NULL"
-
-    if max_retries > 0 and retry_count < max_retries:
-        # Schedule retry with exponential backoff
-        next_retry_sql = calculate_next_retry_at(retry_count)
-        new_retry_count = retry_count + 1
-        delay_minutes = min(RETRY_BASE_DELAY_MINUTES * (2 ** retry_count), 120)
-
-        retry_msg = sanitize_sql_string(
-            f"Retry {new_retry_count}/{max_retries} scheduled (backoff: {delay_minutes}min). Last error: HTTP {response_code}"
-        )
-
+    
+    try:
         await execute_sql_with_cold_start_retry(
             sql_client,
             f"""
-            UPDATE jgilpatrick.apps_central_scheduling
-            SET status = 'pending',
-                retry_count = {new_retry_count},
-                next_retry_at = {next_retry_sql},
+            UPDATE jgilpatrick.apps_central_scheduling 
+            SET status = 'pending', 
                 processed_at = {eastern_time_sql},
-                last_response_code = {response_code},
-                last_response_detail = '{sanitized_detail}',
-                error_message = '{retry_msg}',
-                log_id = {log_id_value}
+                last_response_code = 408,
+                last_response_detail = 'Function timeout approaching - stopped waiting for response',
+                error_message = 'Execution stopped due to function timeout approaching'
             WHERE id = {service_id}
             """,
             method="execute",
-            title=f"Schedule retry {new_retry_count}/{max_retries} for service {service_id}"
+            title=f"Mark service {service_id} as timed out"
         )
+    except Exception as db_error:
+        LOGGER.error(f"Failed to update service {service_id} timeout status in database: {str(db_error)}")
 
-        LOGGER.warning(
-            f"Service {service_id} failed — retry {new_retry_count}/{max_retries} scheduled in {delay_minutes} minutes",
-            extra={
-                "EventType": "ScheduledServiceRetry",
-                "ServiceId": service_id,
-                "FunctionApp": service["function_app"],
-                "Service": service["service"],
-                "RetryCount": new_retry_count,
-                "MaxRetries": max_retries,
-                "BackoffMinutes": delay_minutes,
-                "ResponseCode": response_code
-            }
-        )
-    else:
-        # No retries or retries exhausted — mark as failed permanently
-        exhaustion_note = ""
-        if max_retries > 0:
-            exhaustion_note = f" (retries exhausted: {retry_count}/{max_retries})"
 
-        fail_msg = sanitize_sql_string(
-            f"Service execution failed with HTTP {response_code}{exhaustion_note}"
-        )
+async def handle_service_failure(sql_client: SQLClient, service: Dict[str, Any], current_time: datetime, response_code: int, response_detail: str, log_id: Optional[int] = None) -> None:
+    """Handle service execution failure with per-service retry logic.
 
+    Services with max_retries=0 (email-sending services) fail permanently.
+    All other services retry with linear backoff: 15min * (retry_count + 1).
+    """
+    service_id = service["id"]
+    retry_count = service.get("retry_count", 0) or 0
+    max_retries = service.get("max_retries", 0) or 0
+
+    # Sanitize response detail
+    sanitized_detail = sanitize_sql_string(response_detail)
+    eastern_time_sql = get_eastern_time_sql()
+
+    # Build log_id value (NULL if not provided)
+    log_id_value = str(log_id) if log_id is not None else "NULL"
+
+    if max_retries == 0 or retry_count >= max_retries:
+        # No retries allowed or retries exhausted - mark as permanently failed
         await execute_sql_with_cold_start_retry(
             sql_client,
             f"""
@@ -1018,76 +928,189 @@ async def handle_service_failure(
                 processed_at = {eastern_time_sql},
                 last_response_code = {response_code},
                 last_response_detail = '{sanitized_detail}',
-                error_message = '{fail_msg}',
+                error_message = 'Service execution failed with HTTP {response_code}',
                 log_id = {log_id_value}
             WHERE id = {service_id}
             """,
             method="execute",
-            title=f"Mark service {service_id} as failed (no more retries)"
+            title=f"Mark service {service_id} as failed (permanent)"
         )
+        if max_retries == 0:
+            LOGGER.error(f"Service {service_id} failed permanently (max_retries=0, log_id: {log_id})")
+        else:
+            LOGGER.error(f"Service {service_id} failed permanently after {retry_count}/{max_retries} retries (log_id: {log_id})")
+    else:
+        # Schedule retry with linear backoff: 15min * (retry_count + 1)
+        new_retry_count = retry_count + 1
+        backoff_minutes = 15 * new_retry_count
+        next_retry_time = current_time + timedelta(minutes=backoff_minutes)
+        next_retry_str = next_retry_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        LOGGER.error(
-            f"Service {service_id} failed permanently{exhaustion_note}",
-            extra={
-                "EventType": "ScheduledServiceFailed",
-                "ServiceId": service_id,
-                "FunctionApp": service["function_app"],
-                "Service": service["service"],
-                "ResponseCode": response_code,
-                "RetryCount": retry_count,
-                "MaxRetries": max_retries,
-                "ErrorMessage": sanitized_detail[:500]
-            }
+        await execute_sql_with_cold_start_retry(
+            sql_client,
+            f"""
+            UPDATE jgilpatrick.apps_central_scheduling
+            SET status = 'pending',
+                processed_at = {eastern_time_sql},
+                last_response_code = {response_code},
+                last_response_detail = '{sanitized_detail}',
+                error_message = 'Service execution failed with HTTP {response_code} (retry {new_retry_count}/{max_retries})',
+                retry_count = {new_retry_count},
+                next_retry_at = '{next_retry_str}',
+                log_id = {log_id_value}
+            WHERE id = {service_id}
+            """,
+            method="execute",
+            title=f"Schedule service {service_id} for retry {new_retry_count}/{max_retries}"
         )
+        LOGGER.warning(f"Service {service_id} failed, scheduling retry {new_retry_count}/{max_retries} at {next_retry_str} (log_id: {log_id})")
 
 
-async def execute_service_request(
-    service: Dict[str, Any],
-    current_time: datetime,
-    master_logger: Optional[ServiceLogger] = None
-) -> tuple[bool, int, str, Optional[int]]:
-    """Execute HTTP request to the service trigger URL and 202 polling.
+def is_sleeping_service_response(response_code: int, response_detail: str) -> bool:
+    """Determine if the response indicates a sleeping Azure Function App."""
+    # Common indicators of sleeping services
+    sleeping_indicators = [
+        "function host is not running",
+        "service unavailable",
+        "502 bad gateway",
+        "503 service unavailable",
+        "cold start",
+        "warming up",
+        "host not available"
+    ]
+    
+    # Check for specific status codes that often indicate sleeping services
+    if response_code in [502, 503, 504]:
+        return True
+    
+    # Check response text for sleeping indicators
+    if response_detail:
+        response_lower = response_detail.lower()
+        return any(indicator in response_lower for indicator in sleeping_indicators)
+    
+    return False
 
+
+async def poll_for_completion(service_id: str, trigger_url: str, timeout_tracker: TimeoutTracker) -> tuple[bool, int, str]:
+    """
+    Poll for completion of a 202 response until timeout or completion.
+    
+    Args:
+        service_id: Service ID for logging
+        trigger_url: URL to poll for status
+        timeout_tracker: Timeout tracker to check remaining time
+    
     Returns:
-        Tuple of (success, response_code, response_detail, log_id)
+        Tuple of (success, response_code, response_detail)
+    """
+    start_polling_time = time.time()
+    
+    while True:
+        # Check if we're approaching the 9-minute limit
+        if timeout_tracker.get_remaining_time() < 60:  # Less than 1 minute remaining
+            LOGGER.warning(f"Service {service_id} polling timeout approaching, stopping poll")
+            return False, 408, "Polling timeout - function approaching 9-minute limit"
+        
+        # Check if we've been polling for too long
+        elapsed_polling = time.time() - start_polling_time
+        if elapsed_polling > MAX_POLLING_TIME:
+            LOGGER.warning(f"Service {service_id} polling exceeded {MAX_POLLING_TIME}s, stopping poll")
+            return False, 408, f"Polling exceeded {MAX_POLLING_TIME}s - assuming long-running operation"
+        
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                # Use GET request for polling (assuming the service provides a status endpoint)
+                # If the service doesn't have a status endpoint, we'll get a 404/405 and treat as completion
+                response = await client.get(trigger_url)
+                
+                response_code = response.status_code
+                try:
+                    response_detail = response.text[:4000]
+                except Exception:
+                    response_detail = "Unable to read response body"
+                
+                # Check for completion (2xx status codes)
+                if 200 <= response_code < 300:
+                    LOGGER.info(f"Service {service_id} polling completed successfully: {response_code}")
+                    return True, response_code, response_detail
+                
+                # Check for 202 (still processing)
+                elif response_code == 202:
+                    LOGGER.info(f"Service {service_id} still processing (202), continuing to poll...")
+                    await asyncio.sleep(POLLING_INTERVAL)
+                    continue
+                
+                # Other status codes - treat as completion (success or failure)
+                else:
+                    LOGGER.info(f"Service {service_id} polling completed with status {response_code}")
+                    return response_code < 400, response_code, response_detail
+                    
+        except httpx.TimeoutException:
+            LOGGER.warning(f"Service {service_id} polling request timed out, continuing to poll...")
+            await asyncio.sleep(POLLING_INTERVAL)
+            continue
+        except Exception as e:
+            LOGGER.error(f"Service {service_id} polling error: {str(e)}")
+            return False, 500, f"Polling error: {str(e)}"
+
+
+async def execute_service_request_with_timeout(
+    service: Dict[str, Any], 
+    current_time: datetime, 
+    timeout_tracker: TimeoutTracker,
+    master_logger: Optional[MasterServiceLogger] = None
+) -> tuple[bool, int, str, bool, Optional[int]]:
+    """Execute HTTP request to the service trigger URL with timeout awareness and 202 polling.
+    
+    Returns:
+        Tuple of (success, response_code, response_detail, was_timeout, log_id)
         log_id is extracted from response body if present, None otherwise.
     """
     service_id = service["id"]
     trigger_url = service["trigger_url"]
     json_body = service["json_body"]
-
+    
+    # Check if we have enough time to make the request
+    remaining_time = timeout_tracker.get_remaining_time()
+    if remaining_time < 60:  # Need at least 1 minute
+        LOGGER.warning(f"Insufficient time remaining ({remaining_time:.1f}s) to execute service {service_id}")
+        return False, 408, "Insufficient time remaining for execution", True, None
+    
     try:
         # Parse JSON body
         try:
             parsed_json = json.loads(json_body) if isinstance(json_body, str) else json_body
-
+            
             # Add parent context to JSON body if master_logger is provided
             if master_logger and master_logger.log_id is not None:
                 child_context = master_logger.get_child_context()
                 parsed_json.update(child_context)
                 LOGGER.info(f"Service {service_id}: Added parent context - parent_service_id: {child_context['parent_service_id']}, root_id: {child_context['root_id']}")
-
+                
         except json.JSONDecodeError as e:
             error_msg = f"Invalid JSON body: {str(e)}"
             LOGGER.error(f"Service {service_id} has invalid JSON body: {error_msg}")
-            return False, 400, error_msg, None  # 400 Bad Request for invalid JSON
-
+            return False, 400, error_msg, False, None  # 400 Bad Request for invalid JSON
+        
+        # Calculate dynamic timeout based on remaining function time
+        request_timeout = min(SERVICE_REQUEST_TIMEOUT, remaining_time - 30)  # Leave 30s buffer
+        
         # Make HTTP request - NO RETRIES to prevent duplicate email sends
         try:
-            async with httpx.AsyncClient(timeout=SERVICE_REQUEST_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
                 response = await client.post(
                     trigger_url,
                     json=parsed_json,
                     headers={"Content-Type": "application/json"}
                 )
-
+                
                 # Get response details
                 response_code = response.status_code
                 try:
                     response_detail = response.text[:4000]  # Limit response size
                 except Exception:
                     response_detail = "Unable to read response body"
-
+                
                 # Extract log_id from response body if present (for any 2xx response)
                 log_id = None
                 try:
@@ -1102,107 +1125,56 @@ async def execute_service_request(
                 except Exception:
                     # Response might not be JSON, that's okay
                     pass
-
+                
                 # Handle 202 Accepted - start polling master services log by log_id (no HTTP polling)
                 if response_code == 202:
                     LOGGER.info(f"Service {service_id} returned 202 Accepted, parsing log_id and polling master services log...")
                     if log_id is None:
                         LOGGER.error(f"Service {service_id} returned 202 but no log_id found in response; cannot poll status")
-                        return False, 500, "202 Accepted but missing log_id for status polling", None
+                        return False, 500, "202 Accepted but missing log_id for status polling", False, None
 
-                    success, final_code, final_detail = await poll_master_log_for_completion(str(log_id))
-                    return success, final_code, final_detail, log_id
-
+                    success, final_code, final_detail = await poll_master_log_for_completion(str(log_id), timeout_tracker)
+                    return success, final_code, final_detail, False, log_id
+                
                 # Consider 2xx status codes as successful
                 elif 200 <= response_code < 300:
                     if log_id is not None:
                         LOGGER.info(f"Service {service_id} HTTP request successful: {response_code} (log_id: {log_id})")
                     else:
                         LOGGER.info(f"Service {service_id} HTTP request successful: {response_code}")
-                    return True, response_code, response_detail, log_id
+                    return True, response_code, response_detail, False, log_id
                 else:
                     LOGGER.error(f"Service {service_id} HTTP request failed: {response_code} - {response_detail}")
-                    return False, response_code, response_detail, log_id
-
+                    return False, response_code, response_detail, False, log_id
+                    
         except httpx.TimeoutException:
-            error_msg = f"HTTP request timed out after {SERVICE_REQUEST_TIMEOUT} seconds"
+            error_msg = f"HTTP request timed out after {request_timeout} seconds"
             LOGGER.error(f"Service {service_id} HTTP request timed out")
-            return False, 408, error_msg, None  # 408 Request Timeout
+            return False, 408, error_msg, False, None  # 408 Request Timeout
         except Exception as e:
             error_msg = f"HTTP request error: {str(e)}"
             LOGGER.error(f"Service {service_id} HTTP request error: {error_msg}")
-            return False, 500, error_msg, None  # 500 Internal Server Error for connection errors
-
+            return False, 500, error_msg, False, None  # 500 Internal Server Error for connection errors
+                
     except Exception as e:
         error_msg = f"Service execution error: {str(e)}"
         LOGGER.error(f"Service {service_id} execution error: {error_msg}")
-        return False, 500, error_msg, None  # 500 Internal Server Error
+        return False, 500, error_msg, False, None  # 500 Internal Server Error
 
 
 async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any], error_msg: str) -> None:
-    """
-    Handle service processing exception with configurable retry.
-
-    Same retry logic as handle_service_failure: if max_retries > 0 and retries
-    remain, schedule exponential backoff retry; otherwise mark as failed permanently.
-    """
+    """Handle service processing exception with per-service retry logic."""
     service_id = service["id"]
-    max_retries = service.get("max_retries") or 0
-    retry_count = service.get("retry_count") or 0
+    retry_count = service.get("retry_count", 0) or 0
+    max_retries = service.get("max_retries", 0) or 0
 
+    # Sanitize error message
     sanitized_error = sanitize_sql_string(error_msg)
     eastern_time_sql = get_eastern_time_sql()
 
     try:
-        if max_retries > 0 and retry_count < max_retries:
-            # Schedule retry with exponential backoff
-            next_retry_sql = calculate_next_retry_at(retry_count)
-            new_retry_count = retry_count + 1
-            delay_minutes = min(RETRY_BASE_DELAY_MINUTES * (2 ** retry_count), 120)
-
-            retry_msg = sanitize_sql_string(
-                f"Retry {new_retry_count}/{max_retries} scheduled (backoff: {delay_minutes}min). Exception: {error_msg[:200]}"
-            )
-
-            await execute_sql_with_cold_start_retry(
-                sql_client,
-                f"""
-                UPDATE jgilpatrick.apps_central_scheduling
-                SET status = 'pending',
-                    retry_count = {new_retry_count},
-                    next_retry_at = {next_retry_sql},
-                    processed_at = {eastern_time_sql},
-                    last_response_detail = NULL,
-                    error_message = '{retry_msg}'
-                WHERE id = {service_id}
-                """,
-                method="execute",
-                title=f"Schedule retry {new_retry_count}/{max_retries} for service {service_id} (exception)"
-            )
-
-            LOGGER.warning(
-                f"Service {service_id} exception — retry {new_retry_count}/{max_retries} scheduled in {delay_minutes} minutes",
-                extra={
-                    "EventType": "ScheduledServiceRetry",
-                    "ServiceId": service_id,
-                    "FunctionApp": service.get("function_app", "unknown"),
-                    "Service": service.get("service", "unknown"),
-                    "RetryCount": new_retry_count,
-                    "MaxRetries": max_retries,
-                    "BackoffMinutes": delay_minutes,
-                    "ErrorMessage": sanitized_error[:500]
-                }
-            )
-        else:
-            # No retries or retries exhausted — mark as failed permanently
-            exhaustion_note = ""
-            if max_retries > 0:
-                exhaustion_note = f" (retries exhausted: {retry_count}/{max_retries})"
-
-            fail_msg = sanitize_sql_string(
-                f"Exception during processing{exhaustion_note}: {error_msg[:300]}"
-            )
-
+        if max_retries == 0 or retry_count >= max_retries:
+            # No retries allowed or retries exhausted - mark as permanently failed
             await execute_sql_with_cold_start_retry(
                 sql_client,
                 f"""
@@ -1210,22 +1182,37 @@ async def handle_service_exception(sql_client: SQLClient, service: Dict[str, Any
                 SET status = 'failed',
                     processed_at = {eastern_time_sql},
                     last_response_detail = NULL,
-                    error_message = '{fail_msg}'
+                    error_message = '{sanitized_error}'
                 WHERE id = {service_id}
                 """,
                 method="execute",
-                title=f"Mark service {service_id} as failed due to exception (no more retries)"
+                title=f"Mark service {service_id} as failed due to exception (permanent)"
             )
+        else:
+            # Schedule retry with linear backoff
+            eastern = pytz.timezone('US/Eastern')
+            current_time = datetime.now(eastern)
+            new_retry_count = retry_count + 1
+            backoff_minutes = 15 * new_retry_count
+            next_retry_time = current_time + timedelta(minutes=backoff_minutes)
+            next_retry_str = next_retry_time.strftime("%Y-%m-%d %H:%M:%S")
 
-            LOGGER.error(f"Service {service_id} exception — failed permanently{exhaustion_note}", extra={
-                "EventType": "ScheduledServiceException",
-                "ServiceId": service_id,
-                "FunctionApp": service.get("function_app", "unknown"),
-                "Service": service.get("service", "unknown"),
-                "RetryCount": retry_count,
-                "MaxRetries": max_retries,
-                "ErrorMessage": sanitized_error[:500]
-            })
+            await execute_sql_with_cold_start_retry(
+                sql_client,
+                f"""
+                UPDATE jgilpatrick.apps_central_scheduling
+                SET status = 'pending',
+                    processed_at = {eastern_time_sql},
+                    last_response_detail = NULL,
+                    error_message = '{sanitized_error} (retry {new_retry_count}/{max_retries})',
+                    retry_count = {new_retry_count},
+                    next_retry_at = '{next_retry_str}'
+                WHERE id = {service_id}
+                """,
+                method="execute",
+                title=f"Schedule service {service_id} for retry {new_retry_count}/{max_retries} due to exception"
+            )
+            LOGGER.warning(f"Service {service_id} exception, scheduling retry {new_retry_count}/{max_retries} at {next_retry_str}")
     except Exception as db_error:
         LOGGER.error(f"Failed to update service {service_id} status in database: {str(db_error)}")
 
@@ -1248,107 +1235,107 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
     7. Only logs to master services log when services are actually triggered
     """
     LOGGER.info("Scheduler timer function started")
-
-    # Initialize master service logger for this timer execution
-    master_logger = ServiceLogger(
+    
+    # Initialize master service logger for this timer execution (but don't log yet)
+    master_logger = MasterServiceLogger(
         service_name="scheduler_timer",
-        function_app="fx-app-apps-services",
+        function_app="apps_services", 
         trigger_source="timer"
     )
-
+    
     async with SQLClient() as sql_client:
         try:
-            # Log start BEFORE any processing — every timer execution gets a master log row
-            await master_logger.log_start(
-                sql_client,
-                request_data=json.dumps({
-                    "is_past_due": timer.past_due,
-                    "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
-                }),
-                metadata={
-                    "function_type": "timer",
-                    "schedule": "0 0,15,30,45 * * * *",
-                    "is_past_due": timer.past_due
-                }
-            )
-            LOGGER.info(f"Scheduler timer logged to master services log with ID: {master_logger.log_id}")
-
-            # Transition to running before processing
-            await master_logger.log_running(sql_client)
-
             # Track the timer execution start
             await track_event("scheduler_timer_started", {
                 "is_past_due": timer.past_due,
-                "schedule_status": str(timer.schedule_status) if timer.schedule_status else None,
-                "master_log_id": master_logger.log_id
+                "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
             })
-
+            
             if timer.past_due:
                 LOGGER.warning("Timer function is running late")
-
+            
             # Process scheduled services with master logger context
-            results = await process_scheduled_services_with_overrides(
+            results, timeout_tracker = await process_scheduled_services_with_overrides(
                 master_logger=master_logger
             )
-
-            # Log summary
+            
+            # Log summary including timeout information
+            timeout_info = ""
+            if timeout_tracker.timeout_reached:
+                timeout_info = " (TIMEOUT REACHED)"
+            
             summary = (
-                f"Scheduler timer completed - "
+                f"Scheduler timer completed{timeout_info} - "
                 f"Processed: {results['processed']}, "
                 f"Successful: {results['successful']}, "
                 f"Failed: {results['failed']}, "
                 f"Skipped: {results['skipped']}, "
+                f"Timed out: {results['timed_out']}, "
                 f"Stuck services found: {results['stuck_services_found']}"
             )
             LOGGER.info(summary)
-
+            
             # Track completion
             await track_event("scheduler_timer_completed", {
-                **results,
-                "master_log_id": master_logger.log_id
+                **results
             })
-
-            # Log terminal status based on results
-            if results["errors"]:
-                LOGGER.error(f"Errors during processing: {results['errors']}")
-                await master_logger.log_warning(
+            
+            # Only log to master services log if services were actually executed (not just processed)
+            if results['successful'] > 0 or results['failed'] > 0:
+                # Log start of timer execution to master services log
+                await master_logger.log_start(
                     sql_client,
-                    f"Completed with {len(results['errors'])} errors",
-                    response_data=json.dumps(results),
+                    request_data=json.dumps({
+                        "is_past_due": timer.past_due,
+                        "schedule_status": str(timer.schedule_status) if timer.schedule_status else None
+                    }),
                     metadata={
-                        "errors": results['errors']
+                        "function_type": "timer",
+                        "schedule": "0 0,15,30,45 * * * *",
+                        "is_past_due": timer.past_due
                     }
                 )
+                
+                LOGGER.info(f"Scheduler timer logged to master services log with ID: {master_logger.log_id}")
+                
+                if results["errors"]:
+                    LOGGER.error(f"Errors during processing: {results['errors']}")
+                    # Log as warning since some services succeeded
+                    await master_logger.log_warning(
+                        sql_client,
+                        f"Completed with {len(results['errors'])} errors",
+                        response_data=json.dumps(results),
+                        metadata={
+                            "errors": results['errors'],
+                            "timeout_reached": timeout_tracker.timeout_reached
+                        }
+                    )
+                else:
+                    # Log successful completion
+                    await master_logger.log_success(
+                        sql_client,
+                        response_data=json.dumps(results),
+                        metadata={
+                            "timeout_reached": timeout_tracker.timeout_reached
+                        }
+                    )
             else:
-                await master_logger.log_success(
-                    sql_client,
-                    response_data=json.dumps(results),
-                    metadata={}
-                )
-
+                LOGGER.info("No services were triggered - skipping master services log entry")
+                
         except Exception as e:
             error_msg = f"Scheduler timer function failed: {str(e)}"
             LOGGER.error(error_msg)
-
+            
             # Log error to master services log if possible
             try:
-                if master_logger.log_id is not None:
-                    await master_logger.log_error(
-                        sql_client,
-                        error_msg,
-                        metadata={"exception_type": type(e).__name__}
-                    )
-                else:
-                    # log_start failed — try to create a minimal entry
-                    await master_logger.log_start(sql_client)
-                    await master_logger.log_error(
-                        sql_client,
-                        error_msg,
-                        metadata={"exception_type": type(e).__name__}
-                    )
+                await master_logger.log_error(
+                    sql_client,
+                    error_msg,
+                    metadata={"exception_type": type(e).__name__}
+                )
             except Exception as log_error:
                 LOGGER.error(f"Failed to log error to master services log: {str(log_error)}")
-
+            
             await track_exception(e, {
                 "operation": "scheduler_timer",
                 "master_log_id": master_logger.log_id
@@ -1401,9 +1388,9 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     LOGGER.info(f"   🕐 Timestamp: {datetime.now().isoformat()}")
     
     # Initialize master service logger for this HTTP execution
-    master_logger = ServiceLogger(
+    master_logger = MasterServiceLogger(
         service_name="scheduler_http_trigger", 
-        function_app="fx-app-apps-services",
+        function_app="apps_services",
         trigger_source="HTTP"
     )
     
@@ -1424,10 +1411,7 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             )
             
             LOGGER.info(f"HTTP Scheduler trigger logged to master services log with ID: {master_logger.log_id}")
-
-            # Transition to running before processing
-            await master_logger.log_running(sql_client)
-
+            
             # Parse request body for options
             bypass_window_check = False
             force_service_ids = None
@@ -1482,69 +1466,78 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             
             # Process scheduled services with optional overrides
             LOGGER.info(f"   🚀 Starting service processing...")
-
+            
             if schedule_id:
                 # Force execution of specific schedule_id - bypass ALL checks
-                results = await process_scheduled_services_with_overrides(
+                results, timeout_tracker = await process_scheduled_services_with_overrides(
                     bypass_window_check=True,
                     force_service_ids=[schedule_id],
                     master_logger=master_logger
                 )
             elif bypass_window_check or force_service_ids:
-                results = await process_scheduled_services_with_overrides(
+                results, timeout_tracker = await process_scheduled_services_with_overrides(
                     bypass_window_check=bypass_window_check,
                     force_service_ids=force_service_ids,
                     master_logger=master_logger
                 )
             else:
                 # Use standard processing logic
-                results = await process_scheduled_services_with_overrides(
+                results, timeout_tracker = await process_scheduled_services_with_overrides(
                     master_logger=master_logger
                 )
-
+            
             execution_time = time.time() - start_time
-
-            LOGGER.info(f"   ✅ HTTP SCHEDULER COMPLETED")
+            
+            # Log detailed summary with emojis for visibility
+            timeout_info = ""
+            if timeout_tracker.timeout_reached:
+                timeout_info = " ⏰ (TIMEOUT REACHED)"
+            
+            LOGGER.info(f"   ✅ HTTP SCHEDULER COMPLETED{timeout_info}")
             LOGGER.info(f"   📊 EXECUTION SUMMARY:")
             LOGGER.info(f"      • Execution Time: {execution_time:.1f}s")
             LOGGER.info(f"      • Services Processed: {results['processed']}")
             LOGGER.info(f"      • ✅ Successful: {results['successful']}")
             LOGGER.info(f"      • ❌ Failed: {results['failed']}")
             LOGGER.info(f"      • ⏭️  Skipped: {results['skipped']}")
+            LOGGER.info(f"      • ⏰ Timed Out: {results['timed_out']}")
             LOGGER.info(f"      • 🔍 Stuck Services Found: {results['stuck_services_found']}")
-
+            
             if results['errors']:
                 LOGGER.error(f"   🚨 ERRORS ENCOUNTERED:")
                 for i, error in enumerate(results['errors'], 1):
                     LOGGER.error(f"      {i}. {error}")
             else:
                 LOGGER.info(f"      • 🎉 No errors encountered")
-
+            
             # Track completion
             await track_event("scheduler_http_trigger_completed", {
                 **results,
                 "execution_time_seconds": execution_time,
+                "timeout_reached": timeout_tracker.timeout_reached,
                 "master_log_id": master_logger.log_id
             })
-
+            
             # Return success response
             response_data = {
                 "success": True,
-                "message": "Scheduler executed successfully",
+                "message": f"Scheduler executed successfully{timeout_info}",
                 "results": results,
                 "execution_time_seconds": round(execution_time, 2),
+                "timeout_reached": timeout_tracker.timeout_reached,
                 "master_log_id": master_logger.log_id
             }
-
+            
             # Log completion to master services log
             if results["errors"]:
                 await master_logger.log_warning(
                     sql_client,
-                    f"Completed with {len(results['errors'])} errors",
+                    f"Completed with {len(results['errors'])} errors", 
                     response_data=json.dumps(response_data),
                     metadata={
                         "execution_mode": execution_mode,
-                        "errors": results['errors']
+                        "errors": results['errors'],
+                        "timeout_reached": timeout_tracker.timeout_reached
                     }
                 )
             else:
@@ -1552,7 +1545,8 @@ async def scheduler_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
                     sql_client,
                     response_data=json.dumps(response_data),
                     metadata={
-                        "execution_mode": execution_mode
+                        "execution_mode": execution_mode,
+                        "timeout_reached": timeout_tracker.timeout_reached
                     }
                 )
             
