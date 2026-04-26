@@ -47,4 +47,8 @@ jobs:
           slot-name: "Production"
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE }}
-          remote-build: true
+          # publish-profile uses Kudu /api/zipdeploy which disables Oryx by default.
+          # These params force the build endpoint /api/deployments/zipdeploy?isAsync=true
+          # so Oryx server-side install runs.
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
