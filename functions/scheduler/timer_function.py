@@ -160,6 +160,61 @@ def sanitize_sql_string(value: str, max_length: int = 3900) -> str:
     return sanitized
 
 
+async def log_execution(
+    sql_client: SQLClient,
+    schedule_id: int,
+    function_app: str,
+    service_name: str,
+    triggered_at: datetime,
+    status: str,
+    http_status_code: Optional[int] = None,
+    request_payload: Optional[str] = None,
+    response_detail: Optional[str] = None,
+    error_message: Optional[str] = None,
+    trigger_source: Optional[str] = None,
+    log_id: Optional[int] = None,
+    retry_attempt: int = 0,
+) -> None:
+    """Insert a row into apps_scheduler_execution_log for granular per-execution reporting.
+
+    Restored after commit ba8c4cc dropped the writer while leaving the reader in
+    scheduler_endpoints.py. The keystone scheduler dashboard reads from this table.
+    """
+    try:
+        eastern = pytz.timezone("US/Eastern")
+        completed_at = datetime.now(eastern)
+        duration_ms = int((completed_at - triggered_at).total_seconds() * 1000)
+
+        fa = sanitize_sql_string(function_app)
+        sn = sanitize_sql_string(service_name)
+        stat = sanitize_sql_string(status)
+        req_payload = f"'{sanitize_sql_string(request_payload)}'" if request_payload else "NULL"
+        resp_detail = f"'{sanitize_sql_string(response_detail)}'" if response_detail else "NULL"
+        err_msg = f"'{sanitize_sql_string(error_message)}'" if error_message else "NULL"
+        http_code = str(http_status_code) if http_status_code is not None else "NULL"
+        lid = str(log_id) if log_id is not None else "NULL"
+        ts_val = f"'{sanitize_sql_string(trigger_source)}'" if trigger_source else "NULL"
+
+        insert_sql = f"""
+            INSERT INTO jgilpatrick.apps_scheduler_execution_log
+                (schedule_id, function_app, service_name, triggered_at, completed_at,
+                 duration_ms, status, http_status_code, request_payload, response_detail,
+                 error_message, trigger_source, log_id, retry_attempt)
+            VALUES
+                ({schedule_id}, '{fa}', '{sn}',
+                 '{triggered_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
+                 '{completed_at.strftime("%Y-%m-%d %H:%M:%S.%f")}',
+                 {duration_ms}, '{stat}', {http_code}, {req_payload}, {resp_detail},
+                 {err_msg}, {ts_val}, {lid}, {retry_attempt})
+        """
+        await execute_sql_with_cold_start_retry(
+            sql_client, insert_sql, method="execute",
+            title=f"Log execution for schedule {schedule_id} ({status})"
+        )
+    except Exception as e:
+        LOGGER.error(f"Failed to log execution for schedule {schedule_id}: {e}")
+
+
 def is_within_schedule_window(current_time: datetime, scheduled_time_str: str, window_minutes: int = 15) -> bool:
     """
     Check if current time is within the scheduled time window.
@@ -508,17 +563,34 @@ async def process_scheduled_services_with_overrides(
                         "function_app": function_app,
                         "service": service_name
                     })
-                    
+
+                    # Capture triggered_at + source for per-execution log row
+                    eastern_tz_for_log = pytz.timezone("US/Eastern")
+                    exec_triggered_at = datetime.now(eastern_tz_for_log)
+                    trigger_src = getattr(master_logger, "trigger_source", "timer") if master_logger else "timer"
+
                     # Execute the service with timeout awareness
                     success, response_code, response_detail, was_timeout, log_id = await execute_service_request_with_timeout(
                         service, current_time, timeout_tracker, master_logger
                     )
-                    
+
                     if was_timeout:
                         # Handle timeout case
                         await handle_service_timeout(sql_client, service, current_time)
                         results["timed_out"] += 1
                         LOGGER.warning(f"      ⏰ Service {service_id} timed out due to function timeout approaching")
+
+                        await log_execution(
+                            sql_client, schedule_id=service_id,
+                            function_app=function_app, service_name=service_name,
+                            triggered_at=exec_triggered_at, status="timeout",
+                            http_status_code=response_code if response_code else 408,
+                            request_payload=service.get("json_body"),
+                            response_detail=response_detail,
+                            error_message="Function timeout approaching - service execution aborted",
+                            trigger_source=trigger_src, log_id=log_id,
+                            retry_attempt=service.get("retry_count") or 0,
+                        )
                     elif success:
                         # Update success counters and timestamps
                         sanitized_detail = sanitize_sql_string(response_detail)
@@ -563,7 +635,18 @@ async def process_scheduled_services_with_overrides(
                             "response_code": response_code,
                             "log_id": log_id
                         })
-                        
+
+                        await log_execution(
+                            sql_client, schedule_id=service_id,
+                            function_app=function_app, service_name=service_name,
+                            triggered_at=exec_triggered_at, status="success",
+                            http_status_code=response_code,
+                            request_payload=service.get("json_body"),
+                            response_detail=response_detail,
+                            trigger_source=trigger_src, log_id=log_id,
+                            retry_attempt=service.get("retry_count") or 0,
+                        )
+
                     else:
                         # Handle failure with retry logic (respects per-service max_retries)
                         await handle_service_failure(sql_client, service, current_time, response_code, response_detail, log_id)
@@ -572,15 +655,47 @@ async def process_scheduled_services_with_overrides(
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}, log_id: {log_id}): {response_detail[:200]}...")
                         else:
                             LOGGER.error(f"      ❌ Service {service_id} failed (HTTP {response_code}): {response_detail[:200]}...")
-                        
+
+                        fail_status = "timeout" if response_code == 408 else "failed"
+                        await log_execution(
+                            sql_client, schedule_id=service_id,
+                            function_app=function_app, service_name=service_name,
+                            triggered_at=exec_triggered_at, status=fail_status,
+                            http_status_code=response_code,
+                            request_payload=service.get("json_body"),
+                            response_detail=response_detail,
+                            error_message=response_detail[:2000] if response_detail else None,
+                            trigger_source=trigger_src, log_id=log_id,
+                            retry_attempt=service.get("retry_count") or 0,
+                        )
+
                 except Exception as e:
                     error_msg = str(e)
                     results["failed"] += 1
                     results["errors"].append(f"Service {service_id} ({function_app}/{service_name}): {error_msg}")
-                    
+
                     # Mark service as failed
                     await handle_service_exception(sql_client, service, error_msg)
-                    
+
+                    # Log execution as error. exec_triggered_at may not be set yet if the
+                    # exception fired before the claim (e.g. in the should_trigger check),
+                    # so guard against NameError.
+                    try:
+                        _excpt_triggered_at = exec_triggered_at  # type: ignore[name-defined]
+                        _excpt_trigger_src = trigger_src  # type: ignore[name-defined]
+                    except NameError:
+                        _excpt_triggered_at = datetime.now(pytz.timezone("US/Eastern"))
+                        _excpt_trigger_src = "timer"
+                    await log_execution(
+                        sql_client, schedule_id=service_id,
+                        function_app=function_app, service_name=service_name,
+                        triggered_at=_excpt_triggered_at, status="error",
+                        request_payload=service.get("json_body"),
+                        error_message=error_msg[:2000],
+                        trigger_source=_excpt_trigger_src,
+                        retry_attempt=service.get("retry_count") or 0,
+                    )
+
                     LOGGER.error(f"      💥 Service {service_id} exception: {error_msg}")
                     await track_exception(e, {
                         "service_id": service_id,
