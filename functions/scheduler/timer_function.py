@@ -467,13 +467,18 @@ async def process_scheduled_services_with_overrides(
                     # Atomic claim: only mark as processing if still pending/failed.
                     # OUTPUT without INTO is prohibited when the table has an AFTER UPDATE trigger
                     # (SQL Error 334), so we split into UPDATE + SELECT instead.
-                    eastern_time_sql = get_eastern_time_sql()
+                    # IMPORTANT: capture timestamp once in Python so both queries compare against
+                    # the exact same literal. Using get_eastern_time_sql() in both would call
+                    # SYSDATETIMEOFFSET() twice (T1 != T2) and the verify SELECT would always miss.
+                    _eastern = pytz.timezone('US/Eastern')
+                    _claim_ts = datetime.now(_eastern).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    claim_ts_sql = f"'{_claim_ts}'"
                     await execute_sql_with_cold_start_retry(
                         sql_client,
                         f"""
                         UPDATE jgilpatrick.apps_central_scheduling
                         SET status = 'processing',
-                            last_triggered_at = {eastern_time_sql}
+                            last_triggered_at = {claim_ts_sql}
                         WHERE id = {service_id}
                         AND status IN ('pending', 'failed')
                         """,
@@ -487,7 +492,7 @@ async def process_scheduled_services_with_overrides(
                         SELECT id FROM jgilpatrick.apps_central_scheduling
                         WHERE id = {service_id}
                         AND status = 'processing'
-                        AND last_triggered_at = {eastern_time_sql}
+                        AND last_triggered_at = {claim_ts_sql}
                         """,
                         method="query",
                         title=f"Verify claim for service {service_id}"
