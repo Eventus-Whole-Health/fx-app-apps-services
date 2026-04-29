@@ -928,8 +928,16 @@ async def poll_master_log_for_completion(log_id: str, timeout_tracker: TimeoutTr
     """
     Poll the master services log for the given log_id until completion or timeout.
     Returns (success, http_like_code, detail_message).
+
+    Tolerates transient SQLClient errors (httpx.ReadTimeout, etc.): a single
+    failed poll iteration is logged and retried; only after MAX_CONSECUTIVE_POLL_ERRORS
+    in a row does polling give up. This avoids false-positive failures when
+    the SQL Executor is briefly slow.
     """
+    MAX_CONSECUTIVE_POLL_ERRORS = 3
     start_polling_time = time.time()
+    consecutive_errors = 0
+    last_error_repr = ""
 
     while True:
         # Ensure we leave buffer before function timeout
@@ -955,6 +963,8 @@ async def poll_master_log_for_completion(log_id: str, timeout_tracker: TimeoutTr
                     title=f"Poll master log {log_id}"
                 )
 
+            consecutive_errors = 0  # successful query — reset error counter
+
             if rows and isinstance(rows, list):
                 status_val = (rows[0].get("status") or "").lower()
                 error_msg = rows[0].get("error_message") or ""
@@ -974,8 +984,27 @@ async def poll_master_log_for_completion(log_id: str, timeout_tracker: TimeoutTr
             continue
 
         except Exception as e:
-            LOGGER.error(f"Error polling master log {log_id}: {type(e).__name__}: {repr(e)}", exc_info=True)
-            return False, 500, f"Polling error ({type(e).__name__}): {str(e) or repr(e)}"
+            consecutive_errors += 1
+            last_error_repr = f"{type(e).__name__}: {repr(e)}"
+            LOGGER.warning(
+                f"Poll attempt {consecutive_errors}/{MAX_CONSECUTIVE_POLL_ERRORS} "
+                f"for log_id {log_id} errored: {last_error_repr}"
+            )
+
+            if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                LOGGER.error(
+                    f"Polling for log_id {log_id} gave up after "
+                    f"{MAX_CONSECUTIVE_POLL_ERRORS} consecutive errors. Last: {last_error_repr}",
+                    exc_info=True,
+                )
+                return False, 500, (
+                    f"Polling failed after {MAX_CONSECUTIVE_POLL_ERRORS} consecutive errors "
+                    f"(last: {last_error_repr})"
+                )
+
+            # Transient error — wait and retry
+            await asyncio.sleep(POLLING_INTERVAL)
+            continue
 
 
 def get_next_status(service: Dict[str, Any]) -> str:
