@@ -979,8 +979,8 @@ async def poll_master_log_for_completion(log_id: str, timeout_tracker: TimeoutTr
             continue
 
         except Exception as e:
-            LOGGER.error(f"Error polling master log {log_id}: {str(e)}")
-            return False, 500, f"Polling error: {str(e)}"
+            LOGGER.error(f"Error polling master log {log_id}: {type(e).__name__}: {repr(e)}", exc_info=True)
+            return False, 500, f"Polling error ({type(e).__name__}): {str(e) or repr(e)}"
 
 
 def get_next_status(service: Dict[str, Any]) -> str:
