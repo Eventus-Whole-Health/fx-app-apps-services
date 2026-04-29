@@ -19,8 +19,7 @@ from ..shared.master_service_logger import MasterServiceLogger
 
 LOGGER = logging.getLogger(__name__)
 
-# Constants for timeout and retry handling
-FUNCTION_TIMEOUT_SECONDS = 540  # 9 minutes - leave 1 minute buffer before Azure timeout
+# Constants for retry handling
 SERVICE_REQUEST_TIMEOUT = 300  # 5 minutes timeout per service request (increased from 2 min to handle long-running services)
 SQL_COLD_START_RETRY_DELAY = 5  # Wait 5 seconds before retrying SQL operations
 MAX_SQL_COLD_START_RETRIES = 3  # Maximum retries for SQL cold starts
@@ -29,25 +28,21 @@ MAX_POLLING_TIME = 900  # Poll for up to 15 minutes (accommodates long-running S
 
 
 class TimeoutTracker:
-    """Track function execution time to prevent Azure Function timeout."""
-    
-    def __init__(self, timeout_seconds: int = FUNCTION_TIMEOUT_SECONDS):
+    """No-op tracker. Premium ASP has no function timeout, so we never bail early.
+    Kept as a stub to avoid touching every call site."""
+
+    def __init__(self, timeout_seconds: int = 0):
         self.start_time = time.time()
-        self.timeout_seconds = timeout_seconds
         self.timeout_reached = False
-    
+
     def is_timeout_approaching(self, buffer_seconds: int = 30) -> bool:
-        """Check if we're approaching timeout with given buffer."""
-        elapsed = time.time() - self.start_time
-        return elapsed >= (self.timeout_seconds - buffer_seconds)
-    
+        return False
+
     def get_remaining_time(self) -> float:
-        """Get remaining time in seconds."""
-        elapsed = time.time() - self.start_time
-        return max(0, self.timeout_seconds - elapsed)
-    
+        # Return a large value so any "remaining > N" guards always pass
+        return 1e9
+
     def mark_timeout_reached(self) -> None:
-        """Mark that timeout has been reached."""
         self.timeout_reached = True
 
 

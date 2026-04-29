@@ -27,6 +27,5 @@
     "healthCheckWindow": "00:02:00",
     "healthCheckThreshold": 6,
     "counterThreshold": 0.8
-  },
-  "functionTimeout": "00:10:00"
+  }
 }
