@@ -25,7 +25,7 @@ SERVICE_REQUEST_TIMEOUT = 300  # 5 minutes timeout per service request (increase
 SQL_COLD_START_RETRY_DELAY = 5  # Wait 5 seconds before retrying SQL operations
 MAX_SQL_COLD_START_RETRIES = 3  # Maximum retries for SQL cold starts
 POLLING_INTERVAL = 30  # Poll every 30 seconds for 202 responses
-MAX_POLLING_TIME = 480  # Poll for up to 8 minutes (leaving 1 minute buffer)
+MAX_POLLING_TIME = 900  # Poll for up to 15 minutes (accommodates long-running Synapse pipelines)
 
 
 class TimeoutTracker:
