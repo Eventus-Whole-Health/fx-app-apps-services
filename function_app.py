@@ -32,10 +32,12 @@ from functions.scheduler.timer_function import bp as scheduler_bp
 from functions.master_services_log.status_endpoints import bp as master_services_log_bp
 from functions.trigger_function.trigger_function import bp as trigger_bp
 from functions.scheduler_api.scheduler_endpoints import bp as scheduler_api_bp
+from functions.scheduler_jobs.job_manager import bp as job_manager_bp
 from functions.ots_redis_watchdog.watchdog import bp as ots_redis_watchdog_bp
 
 app.register_blueprint(scheduler_bp)
 app.register_blueprint(master_services_log_bp)
 app.register_blueprint(trigger_bp)
 app.register_blueprint(scheduler_api_bp)
+app.register_blueprint(job_manager_bp)
 app.register_blueprint(ots_redis_watchdog_bp)
