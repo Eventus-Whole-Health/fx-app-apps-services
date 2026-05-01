@@ -6,168 +6,156 @@ Azure Functions app providing core infrastructure services for the Eventus ecosy
 
 ## Services
 
-- **Centralized Scheduler** - Timer trigger (every 15 minutes) to process scheduled services from `apps_central_scheduling` table
-  - Initially disabled (schedule set to impossible date for safe migration testing)
-  - Manual trigger via HTTP endpoint: `POST /api/scheduler/manual-trigger`
-  - Supports `force_service_ids` and `bypass_window_check` parameters
-
-- **Master Services Log Status Endpoints** - Distributed async tracking for long-running services
-  - `GET /api/status/{log_id}` - Service status (pending/success/failed)
-  - `GET /api/result/{log_id}` - Complete execution data with request/response payloads
+- **Centralized Scheduler** (dispatcher) - 15-min timer that evaluates schedules and fires services once per window. Fire-and-forget for async (202) services.
+- **Job Manager** - 2-min timer that polls dispatched execution rows against master services log and reconciles terminal state or enforces per-schedule timeout.
+- **Scheduler API** - CRUD endpoints for managing scheduled services
+- **Master Services Log** - Distributed async tracking for long-running services
+- **Trigger** - Trigger any cataloged function app by ID or name
+- **OTS Redis Watchdog** - Snapshot, restore, and health monitoring for OTS Redis
 
 ## Architecture
 
-### Key Improvements Over apps_services
+### Dispatcher / Job Manager
 
-| Aspect | apps_services | fx-app-apps-services |
-|--------|---------------|----------------------|
-| **Plan** | Flex Consumption (10-min timeout) | Keystone ASP (unlimited) |
-| **Scheduler Timeout** | 9-minute limit with polling cutoff | Unlimited - polls until completion |
-| **Timeout Tracking** | TimeoutTracker class managing limits | Removed - no timeout constraints |
-| **Long-Running Services** | Max 8 minutes with artificial cutoffs | Fully supported (15+ minutes tested) |
-| **Code Complexity** | Timeout checks throughout | Simplified, focused logic |
+The scheduler uses a two-timer architecture:
+
+```
+Every 15 min (dispatcher)          Every 2 min (job manager)
+─────────────────────────          ─────────────────────────
+1. Fetch pending schedules     →   1. Fetch dispatched exec rows
+2. Atomic claim (processing)       2. Check master services log
+3. POST to service                 3. Terminal? → write back
+4. 202? → log 'dispatched'         4. Timeout? → mark 408
+5. Move on                         5. Still running? → skip
+```
+
+No retry logic. Failures wait for the next scheduled occurrence.
 
 ### Function Modules
 
 ```
 functions/
-├── shared/              # Reusable services (unchanged from apps_services)
-│   ├── settings.py      # Pydantic config with caching
-│   ├── sql_client.py    # SQL Executor API client
-│   ├── service_logger.py  # Service log tracking
-│   ├── seq_logging.py   # Structured logging
-│   └── telemetry.py     # Application Insights
+├── shared/                    # Reusable services
+│   ├── settings.py            # Pydantic config with caching
+│   ├── sql_client.py          # SQL Executor API client
+│   ├── service_logger.py      # Service log tracking
+│   ├── seq_logging.py         # Structured logging
+│   └── telemetry.py           # Application Insights
 ├── scheduler/
-│   └── timer_function.py  # Scheduler (simplified - no TimeoutTracker)
-└── master_services_log/
-    └── status_endpoints.py # Status/result HTTP endpoints
+│   └── timer_function.py      # 15-min dispatcher
+├── scheduler_jobs/
+│   └── job_manager.py         # 2-min job reconciler
+├── scheduler_api/
+│   └── scheduler_endpoints.py # Schedule CRUD + health
+├── master_services_log/
+│   └── status_endpoints.py    # Status/result HTTP endpoints
+├── trigger_function/
+│   └── trigger_function.py    # Trigger cataloged apps
+└── ots_redis_watchdog/
+    └── watchdog.py            # OTS Redis watchdog
 ```
 
 ### Three-Layer Logging
 
 1. **Seq** - Real-time structured events (`ServiceStarted`/`Completed`/`Failed`)
 2. **SQL** - Persistent log in `jgilpatrick.apps_master_services_log`
-3. **Application Insights** - Azure telemetry via `app-insights-master` (shared with fx-app-pims-services, fx-app-data-services)
+3. **Application Insights** - Azure telemetry via `app-insights-master`
 
 ## Local Development
-
-### Setup
 
 ```bash
 # Create centralized virtual environment
 python -m venv ~/venv/fx-app-apps-services
 source ~/venv/fx-app-apps-services/bin/activate
-
-# Install dependencies
-cd fx-app-apps-services
 pip install -r requirements.txt
-```
 
-### Running Locally
-
-```bash
+# Run locally
 func start
 ```
 
-Functions will be available at:
+> Timer functions (scheduler, job manager, watchdog) will log listener errors locally — Azurite (Azure Storage emulator) is not running. HTTP functions work normally.
+
+Available locally:
 - Scheduler manual trigger: `http://localhost:7071/api/scheduler/manual-trigger`
+- Scheduler services: `http://localhost:7071/api/scheduler/services`
 - Status endpoint: `http://localhost:7071/api/status/{log_id}`
 - Result endpoint: `http://localhost:7071/api/result/{log_id}`
 
-### Testing
-
-```bash
-# Test status endpoints (use existing log_id from apps_master_services_log)
-curl http://localhost:7071/api/status/12345
-
-# Test manual scheduler trigger
-curl -X POST http://localhost:7071/api/scheduler/manual-trigger \
-  -H "Content-Type: application/json" \
-  -d '{"force_service_ids": [1]}'
-```
-
 ## Deployment
 
-Automatic deployment on push to main via GitHub Actions:
+Automatic on push to main via GitHub Actions:
 
 ```bash
-git add .
-git commit -m "Deploy fx-app-apps-services updates"
+git commit -m "feat: description"
 git push origin main
 ```
-
-Check deployment status in GitHub Actions (`.github/workflows/main_fx-app-apps-services.yml`).
-
-## Configuration
-
-All environment variables are configured in Azure via app settings. Key references:
-- `SQL_EXECUTOR_CLIENT_ID`, `SQL_EXECUTOR_CLIENT_SECRET`, `SQL_EXECUTOR_TENANT_ID` - SQL Executor API credentials
-- `SQL_EXECUTOR_URL`, `SQL_EXECUTOR_SCOPE`, `SQL_EXECUTOR_SERVER` - SQL Executor API endpoints
-- `SEQ_SERVER_URL` - Seq structured logging endpoint
-- `APPLICATIONINSIGHTS_CONNECTION_STRING` - Application Insights connection
 
 ## Database Tables
 
 | Table | Purpose |
 |-------|---------|
 | `jgilpatrick.apps_master_services_log` | Execution tracking for all services |
-| `jgilpatrick.apps_central_scheduling` | Scheduled service definitions |
+| `jgilpatrick.apps_central_scheduling` | Scheduled service definitions (`status`, `max_execution_minutes`) |
+| `jgilpatrick.apps_scheduler_execution_log` | Per-dispatch execution log (dispatched → success/failed/timeout) |
+| `jgilpatrick.apps_function_apps` | Function app catalog (endpoints, auth, host keys) |
 
 ## API Reference
 
-### Scheduler Manual Trigger
+### Scheduler
 
-```bash
+```
 POST /api/scheduler/manual-trigger
-Content-Type: application/json
-
 {
-  "force_service_ids": [1, 2, 3],  # Optional: force specific services
-  "bypass_window_check": false     # Optional: bypass scheduling window
+  "force_service_ids": [1, 2, 3],   // optional
+  "bypass_window_check": false       // optional
 }
+→ {"status": "triggered", "services_found": 3, "dispatched": 2}
+
+GET  /api/scheduler/services
+POST /api/scheduler/services
+PUT  /api/scheduler/services/{id}
+DELETE /api/scheduler/services/{id}
+POST /api/scheduler/services/{id}/trigger
+GET  /api/scheduler/services/{id}/history
+GET  /api/scheduler/health
 ```
 
-Response: `{"status": "triggered", "services_found": 3}`
+### Status / Result
 
-### Status Endpoint
-
-```bash
+```
 GET /api/status/{log_id}
-```
+→ {"status": "success", "started_at": "...", "completed_at": "..."}
 
-Response:
-```json
-{
-  "status": "success",  // or "pending", "failed"
-  "started_at": "2024-02-15T18:30:00Z",
-  "completed_at": "2024-02-15T18:45:00Z"
-}
-```
-
-### Result Endpoint
-
-```bash
 GET /api/result/{log_id}
+→ Full execution data with request/response payloads
 ```
 
-Response: Complete execution data with request/response payloads
+### Trigger
 
-## Migration Notes
+```
+POST /api/trigger/{function_id}
+POST /api/trigger?app={app_name}&function={function_name}
+GET  /api/trigger/list
+```
 
-**Phase of migration:** This is the core infrastructure app for the transition to unlimited timeout architecture.
+## Configuration
 
-**Timer status:** Currently disabled (schedule: `0 0 0 0 * *` - impossible date for safe testing). Will be enabled after verification.
+Key environment variables (all sourced from Key Vault `eventus-apps`):
 
-**Next phases:**
-1. Migrate all fx apps to distributed status endpoints
-2. Enable timer trigger in this app
-3. Decommission apps_services after monitoring period
+| Variable | Purpose |
+|----------|---------|
+| `SQL_EXECUTOR_CLIENT_ID/SECRET/TENANT_ID` | SQL Executor API auth |
+| `SQL_EXECUTOR_URL` | `https://fx-app-data-services.azurewebsites.net/api/sql-executor` |
+| `SQL_EXECUTOR_SCOPE` | `api://8b3542fd-41c7-4aec-b14d-d0ee8342e57a/.default` |
+| `SEQ_SERVER_URL`, `SEQ_API_KEY` | Seq structured logging |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights telemetry |
+| `LOGIC_APP_EMAIL_URL` | Required by settings.py (even if unused) |
+| `AZURE_STORAGE_CONNECTION_STRING` | Required by settings.py (even if unused) |
 
 ## Support
 
-For issues or questions:
-1. Check logs in Seq: filter by `AppName = 'fx-app-apps-services'`
-2. Check SQL logs: query `jgilpatrick.apps_master_services_log`
-3. Check Application Insights for telemetry
+1. Check Seq logs: `~/.dotnet/tools/seqcli search --filter="AppName = 'fx-app-apps-services'"`
+2. Check SQL: `SELECT TOP 10 * FROM jgilpatrick.apps_master_services_log WHERE function_app = 'fx-app-apps-services' ORDER BY started_at DESC`
+3. Check GitHub Actions for deploy status
 
-See `CLAUDE.md` for developer guidelines.
+See `CLAUDE.md` for full developer guidelines and debugging runbook.
