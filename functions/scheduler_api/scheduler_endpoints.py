@@ -247,7 +247,7 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
     Returns every active schedule from apps_central_scheduling with:
     - Health status (healthy/degraded/failing) based on last 5 execution log entries
     - Next computed run time based on frequency and schedule_config
-    - Retry state (retry_count, max_retries, next_retry_at) from Phase 1
+    - Execution timeout config (max_execution_minutes)
 
     GET /api/scheduler/services
 
@@ -302,9 +302,6 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
                     s.triggered_count,
                     s.trigger_limit,
                     s.processed_at,
-                    s.retry_count,
-                    s.max_retries,
-                    s.next_retry_at,
                     s.max_execution_minutes,
                     s.error_message,
                     s.log_id,
@@ -349,9 +346,6 @@ async def list_scheduler_services(req: func.HttpRequest) -> func.HttpResponse:
                     "last_triggered_at": row.get("last_triggered_at"),
                     "next_run_time": next_run_time,
                     "health_status": health_status,
-                    "retry_count": row.get("retry_count", 0),
-                    "max_retries": row.get("max_retries", 0),
-                    "next_retry_at": row.get("next_retry_at"),
                     "triggered_count": row.get("triggered_count", 0),
                     "trigger_limit": row.get("trigger_limit"),
                     "max_execution_minutes": row.get("max_execution_minutes"),
@@ -839,7 +833,7 @@ def _sql_value(value: Any, field_type: str = "string") -> str:
 # System-managed fields that cannot be set via API
 SYSTEM_MANAGED_FIELDS = {
     "id", "status", "triggered_count", "last_triggered_at",
-    "retry_count", "next_retry_at", "processed_at", "log_id",
+    "processed_at", "log_id",
     "error_message", "last_response_code", "last_response_detail",
 }
 
@@ -853,7 +847,6 @@ UPDATABLE_FIELDS = {
     "json_body": "nullable_string",
     "start_date": "nullable_string",
     "trigger_limit": "nullable_int",
-    "max_retries": "nullable_int",
     "max_execution_minutes": "nullable_int",
     "is_active": "bool",
 }
@@ -883,7 +876,6 @@ async def create_schedule(req: func.HttpRequest) -> func.HttpResponse:
         "json_body": "{}",
         "start_date": "2026-03-01T06:00:00",
         "trigger_limit": null,
-        "max_retries": 3,
         "max_execution_minutes": 30
     }
 
@@ -931,18 +923,17 @@ async def create_schedule(req: func.HttpRequest) -> func.HttpResponse:
             json_body = _sql_value(body.get("json_body"), "nullable_string")
             start_date = _sql_value(body.get("start_date"), "nullable_string")
             trigger_limit = _sql_value(body.get("trigger_limit"), "nullable_int")
-            max_retries = _sql_value(body.get("max_retries"), "nullable_int")
             max_execution_minutes = _sql_value(body.get("max_execution_minutes"), "nullable_int")
 
             insert_query = f"""
                 INSERT INTO jgilpatrick.apps_central_scheduling
                     (function_app, service, trigger_url, frequency, schedule_config,
-                     json_body, start_date, trigger_limit, max_retries, max_execution_minutes,
-                     is_active, status, triggered_count, retry_count)
+                     json_body, start_date, trigger_limit, max_execution_minutes,
+                     is_active, status, triggered_count)
                 VALUES
                     ({function_app}, {service}, {trigger_url}, {frequency}, {schedule_config},
-                     {json_body}, {start_date}, {trigger_limit}, {max_retries}, {max_execution_minutes},
-                     1, 'pending', 0, 0)
+                     {json_body}, {start_date}, {trigger_limit}, {max_execution_minutes},
+                     1, 'pending', 0)
             """
 
             await sql.execute(insert_query, method="execute", title="Create new schedule")
@@ -1283,10 +1274,9 @@ async def trigger_service(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        # Trigger the service using existing infrastructure
+        # Trigger the service using existing scheduler infrastructure
         # bypass_window_check=True means run now regardless of schedule window
-        # process_scheduled_services_with_overrides returns (results_dict, TimeoutTracker)
-        result, _timeout_tracker = await process_scheduled_services_with_overrides(
+        result = await process_scheduled_services_with_overrides(
             force_service_ids=[service_id_int],
             bypass_window_check=True,
         )
