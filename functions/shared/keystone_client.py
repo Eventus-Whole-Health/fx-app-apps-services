@@ -46,10 +46,9 @@ class KeystoneClient:
         _retry: bool = True,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._get_token()}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {self._get_token()}"}
+        if json is not None:
+            headers["Content-Type"] = "application/json"
         response = await self._http.request(method, url, headers=headers, json=json)
         if response.status_code == 401 and _retry:
             logger.warning("Keystone returned 401, refreshing token and retrying")
@@ -72,3 +71,9 @@ class KeystoneClient:
 
     async def close(self):
         await self._http.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        await self.close()
