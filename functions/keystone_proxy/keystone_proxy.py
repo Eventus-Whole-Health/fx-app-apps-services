@@ -52,11 +52,13 @@ async def keystone_proxy_handler(req: func.HttpRequest) -> func.HttpResponse:
 
         try:
             client = KeystoneClient()
-
-            if method == "GET":
-                result = await client.get(path)
-            else:
-                result = await client.post(path, request_body)
+            try:
+                if method == "GET":
+                    result = await client.get(path)
+                else:
+                    result = await client.post(path, request_body)
+            finally:
+                await client.close()
 
             await svc_logger.log_success(
                 sql, response_data=json.dumps({"path": path, "method": method})
