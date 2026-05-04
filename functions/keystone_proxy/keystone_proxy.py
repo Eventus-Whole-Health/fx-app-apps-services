@@ -87,6 +87,6 @@ async def keystone_proxy_handler(req: func.HttpRequest) -> func.HttpResponse:
             )
 
 
-@bp.route(route="keystone-proxy", methods=["POST"])
+@bp.route(route="keystone-proxy", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def keystone_proxy(req: func.HttpRequest) -> func.HttpResponse:
     return await keystone_proxy_handler(req)
