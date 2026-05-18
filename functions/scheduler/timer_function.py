@@ -628,6 +628,8 @@ async def process_scheduled_services_with_overrides(
                 results["processed"] += 1
 
                 try:
+                    log_id: Optional[int] = None
+                    exec_triggered_at = datetime.now(eastern)
                     # Determine if this service should fire now
                     if force_service_ids and service_id in force_service_ids:
                         should_fire = True
