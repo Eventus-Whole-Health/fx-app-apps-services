@@ -412,6 +412,58 @@ def _check_monthly(config_str, service, last_triggered, current_time, check_wind
 # HTTP execution (fire-and-forget for 202)
 # ---------------------------------------------------------------------------
 
+def _exception_exec_log_args(
+    *,
+    log_id: Optional[int],
+    exec_triggered_at: datetime,
+    error_msg: str,
+    json_body: Optional[str],
+) -> dict:
+    """Decide how to record an apps_scheduler_execution_log row when the
+    per-service block raised AFTER execute_service_request returned.
+
+    If a 202 + log_id was already received, the job IS dispatched — the
+    failure was a post-dispatch SQL write (e.g. SQL Executor read-timeout
+    on the central-scheduling UPDATE, same fragility as #7). Record it as
+    'dispatched' with the log_id so scheduler_jobs/job_manager.py can
+    reconcile it to its true terminal state. Recording 'error' with
+    log_id=NULL here would strand a successful run as a permanent false
+    error, invisible to the job manager (which filters log_id IS NOT NULL).
+    See GitHub issue #9.
+
+    ``json_body`` is accepted for future use (Path B payload inspection,
+    e.g. inferring dispatch state from request content when log_id is
+    absent) and is intentionally unused by the current decision logic.
+    """
+    # Any log_id (202-async or a sync-200 that returned one) -> 'dispatched':
+    # the job manager reconciles status/http from the master log. Gating on
+    # response_code==202 instead would re-strand sync-200+log_id runs (#9).
+    if log_id is not None:
+        return {
+            "status": "dispatched",
+            "http_status_code": 202,
+            "triggered_at": exec_triggered_at,
+            "response_detail": (
+                "Dispatched (202); post-dispatch error absorbed: "
+                # Truncate to 1000: the fixed prefix consumes column headroom,
+                # keeping the combined response_detail within the column limit.
+                + error_msg[:1000]
+            ),
+            "error_message": None,
+            "log_id": log_id,
+        }
+    return {
+        "status": "error",
+        "http_status_code": None,
+        "triggered_at": exec_triggered_at,
+        "response_detail": None,
+        # Truncate to 2000: no prefix string, so the full error_message
+        # column budget (2000 chars) is available on the error path.
+        "error_message": error_msg[:2000],
+        "log_id": None,
+    }
+
+
 async def execute_service_request(
     service: Dict[str, Any],
     master_logger: Optional[MasterServiceLogger] = None,
@@ -587,6 +639,8 @@ async def process_scheduled_services_with_overrides(
                 results["processed"] += 1
 
                 try:
+                    log_id: Optional[int] = None
+                    exec_triggered_at = datetime.now(eastern)
                     # Determine if this service should fire now
                     if force_service_ids and service_id in force_service_ids:
                         should_fire = True
@@ -800,15 +854,30 @@ async def process_scheduled_services_with_overrides(
                     except Exception:
                         pass
 
-                    # Best-effort execution log
+                    # Best-effort execution log. If a 202 + log_id was already
+                    # received, the job IS dispatched (the failure was a
+                    # post-dispatch SQL write) -- record 'dispatched' with the
+                    # log_id so the job manager reconciles it. Recording
+                    # 'error' with log_id=NULL would strand a successful run as
+                    # a permanent false error (GitHub issue #9).
                     try:
+                        _exec_args = _exception_exec_log_args(
+                            log_id=log_id,
+                            exec_triggered_at=exec_triggered_at,
+                            error_msg=error_msg,
+                            json_body=service.get("json_body"),
+                        )
                         await log_execution(
                             sql_client, schedule_id=service_id,
                             function_app=function_app, service_name=service_name,
-                            triggered_at=datetime.now(eastern), status="error",
+                            triggered_at=_exec_args["triggered_at"],
+                            status=_exec_args["status"],
+                            http_status_code=_exec_args["http_status_code"],
                             request_payload=service.get("json_body"),
-                            error_message=error_msg[:2000],
+                            response_detail=_exec_args["response_detail"],
+                            error_message=_exec_args["error_message"],
                             trigger_source="timer",
+                            log_id=_exec_args["log_id"],
                         )
                     except Exception:
                         pass

@@ -201,11 +201,13 @@ Migration SQL lives in `migrations/`. Run against Apps DB before or alongside de
 |------|---------|--------|
 | `001_scheduler_simplification_additive.sql` | Backfill `max_execution_minutes`, add DEFAULT 30 + NOT NULL, clear stuck retry state | Deployed 2026-05-01 |
 | `002_close_orphan_scheduler_timer_pending.sql` | Close ~110 orphan `scheduler_timer` rows stranded at `status='pending'` by SQL Executor timeouts during `log_start` query-back (#7/#8) | Pending |
+| `003_backfill_false_async_exec_log_rows.sql` | Reclassify historical bogus `error`/`failed` exec-log rows for 202-async services to `success` against `apps_master_services_log` (#9) | Pending — apply at deploy |
 
 ## Changelog
 
 | Date | Change | Impact |
 |------|--------|--------|
+| 2026-05-18 | Per-service exception handler records `dispatched` (with log_id) instead of bogus `error`/NULL for already-dispatched 202-async jobs; migration 003 backfills history (fixes #9) | Job manager can now reconcile these runs; data-services #14/#16/#17 false errors resolved |
 | 2026-05-18 | Split `scheduler_timer` dispatch vs logging try/except; logging timeouts no longer fail the invocation or strand `pending` rows (fixes #7; refutes #8) | SQL Executor read-timeouts during master logging are absorbed; orphan rows self-close by `invocation_id` |
 | 2026-05-01 | Dispatcher/job-manager split, retry logic removed (fixes #5) | Stops duplicate service firing caused by stale next_retry_at |
 | 2026-02-23 | Timer enabled, end-to-end validation passed | Scheduler active in production |
