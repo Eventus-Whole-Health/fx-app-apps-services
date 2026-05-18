@@ -435,6 +435,9 @@ def _exception_exec_log_args(
     e.g. inferring dispatch state from request content when log_id is
     absent) and is intentionally unused by the current decision logic.
     """
+    # Any log_id (202-async or a sync-200 that returned one) -> 'dispatched':
+    # the job manager reconciles status/http from the master log. Gating on
+    # response_code==202 instead would re-strand sync-200+log_id runs (#9).
     if log_id is not None:
         return {
             "status": "dispatched",
