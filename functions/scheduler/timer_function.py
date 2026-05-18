@@ -430,6 +430,10 @@ def _exception_exec_log_args(
     log_id=NULL here would strand a successful run as a permanent false
     error, invisible to the job manager (which filters log_id IS NOT NULL).
     See GitHub issue #9.
+
+    ``json_body`` is accepted for future use (Path B payload inspection,
+    e.g. inferring dispatch state from request content when log_id is
+    absent) and is intentionally unused by the current decision logic.
     """
     if log_id is not None:
         return {
@@ -438,6 +442,8 @@ def _exception_exec_log_args(
             "triggered_at": exec_triggered_at,
             "response_detail": (
                 "Dispatched (202); post-dispatch error absorbed: "
+                # Truncate to 1000: the fixed prefix consumes column headroom,
+                # keeping the combined response_detail within the column limit.
                 + error_msg[:1000]
             ),
             "error_message": None,
@@ -448,6 +454,8 @@ def _exception_exec_log_args(
         "http_status_code": None,
         "triggered_at": exec_triggered_at,
         "response_detail": None,
+        # Truncate to 2000: no prefix string, so the full error_message
+        # column budget (2000 chars) is available on the error path.
         "error_message": error_msg[:2000],
         "log_id": None,
     }
@@ -843,15 +851,30 @@ async def process_scheduled_services_with_overrides(
                     except Exception:
                         pass
 
-                    # Best-effort execution log
+                    # Best-effort execution log. If a 202 + log_id was already
+                    # received, the job IS dispatched (the failure was a
+                    # post-dispatch SQL write) -- record 'dispatched' with the
+                    # log_id so the job manager reconciles it. Recording
+                    # 'error' with log_id=NULL would strand a successful run as
+                    # a permanent false error (GitHub issue #9).
                     try:
+                        _exec_args = _exception_exec_log_args(
+                            log_id=log_id,
+                            exec_triggered_at=exec_triggered_at,
+                            error_msg=error_msg,
+                            json_body=service.get("json_body"),
+                        )
                         await log_execution(
                             sql_client, schedule_id=service_id,
                             function_app=function_app, service_name=service_name,
-                            triggered_at=datetime.now(eastern), status="error",
+                            triggered_at=_exec_args["triggered_at"],
+                            status=_exec_args["status"],
+                            http_status_code=_exec_args["http_status_code"],
                             request_payload=service.get("json_body"),
-                            error_message=error_msg[:2000],
+                            response_detail=_exec_args["response_detail"],
+                            error_message=_exec_args["error_message"],
                             trigger_source="timer",
+                            log_id=_exec_args["log_id"],
                         )
                     except Exception:
                         pass
