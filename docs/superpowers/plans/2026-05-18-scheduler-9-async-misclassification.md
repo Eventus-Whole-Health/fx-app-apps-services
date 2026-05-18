@@ -489,7 +489,7 @@ Run only the Step 0 count to confirm the migration targets a sane number of rows
 ```bash
 sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -G -W -Q "SELECT COUNT(*) AS false_rows_before FROM jgilpatrick.apps_scheduler_execution_log el JOIN jgilpatrick.apps_central_scheduling cs ON el.schedule_id=cs.id WHERE el.status IN ('error','failed') AND el.log_id IS NULL AND cs.last_response_code=202"
 ```
-Expected: a small two-figure count (roughly one error + one error per day for schedules 25 and 28 since they started failing — on the order of ~20–60). If it returns hundreds+, STOP and re-check the scope clause with the user before the migration is ever applied.
+Expected (verified 2026-05-18): **~357 rows**, dominated by schedule 28 (`wiki-analytics-collector`, ~321 over 77 days — it fires ~4×/day, not the originally-estimated ~2/day total) plus schedule 25 (`refresh-patient-cache`, ~36). Only schedules 25 & 28 (both legitimate 202-async) are in scope — the count is high because of schedule 28's cadence, not a broad scope clause. If the result is materially different (e.g. thousands, or other schedule_ids appear), STOP and re-check the scope clause with the user before the migration is ever applied.
 
 - [ ] **Step 3: Commit the migration**
 
@@ -574,7 +574,7 @@ Run (only after deploy success):
 ```bash
 sqlcmd -S asqls-ewh-apps-dev-01.database.windows.net -d asqldb-ewh-apps-dev-01 -G -i migrations/003_backfill_false_async_exec_log_rows.sql
 ```
-Expected: `false_rows_before` = the Task 5 Step 2 count; `false_rows_after` ≈ 0 (only genuinely unmatched rows, if any, remain).
+Expected: `false_rows_before` ≈ 357 (the Task 5 Step 2 count). `false_rows_after` will be **N residual, not 0** — Step 1 only matches rows whose master log row is `status='success'`, so exec rows whose underlying run genuinely failed (master row `failed`/`error`) correctly remain `error`/`failed` and are excluded. Report the outcome as "357 → N residual genuine failures", not as a partial migration. A near-0 residual is plausible (these services succeed almost every run) but a non-zero residual is correct behavior, not a failure.
 
 - [ ] **Step 4: Verify next live runs are correct**
 
