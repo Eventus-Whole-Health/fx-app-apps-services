@@ -14,3 +14,5 @@ app_services.code-workspace
 .cursor/
 logs/
 .claude/worktrees/
+dev_files/
+tests/

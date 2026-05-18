@@ -200,11 +200,13 @@ Migration SQL lives in `migrations/`. Run against Apps DB before or alongside de
 | File | Purpose | Status |
 |------|---------|--------|
 | `001_scheduler_simplification_additive.sql` | Backfill `max_execution_minutes`, add DEFAULT 30 + NOT NULL, clear stuck retry state | Deployed 2026-05-01 |
+| `002_close_orphan_scheduler_timer_pending.sql` | Close ~110 orphan `scheduler_timer` rows stranded at `status='pending'` by SQL Executor timeouts during `log_start` query-back (#7/#8) | Pending |
 
 ## Changelog
 
 | Date | Change | Impact |
 |------|--------|--------|
+| 2026-05-18 | Split `scheduler_timer` dispatch vs logging try/except; logging timeouts no longer fail the invocation or strand `pending` rows (fixes #7; refutes #8) | SQL Executor read-timeouts during master logging are absorbed; orphan rows self-close by `invocation_id` |
 | 2026-05-01 | Dispatcher/job-manager split, retry logic removed (fixes #5) | Stops duplicate service firing caused by stale next_retry_at |
 | 2026-02-23 | Timer enabled, end-to-end validation passed | Scheduler active in production |
 | Initial | Removed TimeoutTracker, unlimited polling on Keystone ASP | Replaced apps_services scheduler |
