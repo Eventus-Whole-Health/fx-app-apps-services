@@ -852,6 +852,9 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
     )
 
     async with SQLClient() as sql_client:
+        # --- Dispatch phase --------------------------------------------------
+        # A genuine failure here is a real dispatcher bug and SHOULD surface
+        # as a failed invocation so it gets alerted on.
         try:
             await track_event("scheduler_timer_started", {
                 "is_past_due": timer.past_due,
@@ -863,22 +866,34 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
             results = await process_scheduled_services_with_overrides(
                 master_logger=master_logger
             )
+        except Exception as e:
+            LOGGER.error(f"Scheduler dispatch failed: {e}")
+            await track_exception(e, {"operation": "scheduler_timer_dispatch"})
+            raise
 
-            summary = (
-                f"Scheduler completed — "
-                f"Processed: {results['processed']}, "
-                f"Successful: {results['successful']}, "
-                f"Failed: {results['failed']}, "
-                f"Dispatched: {results['dispatched']}, "
-                f"Skipped: {results['skipped']}, "
-                f"Stuck reset: {results['stuck_services_found']}"
-            )
-            LOGGER.info(summary)
+        summary = (
+            f"Scheduler completed — "
+            f"Processed: {results['processed']}, "
+            f"Successful: {results['successful']}, "
+            f"Failed: {results['failed']}, "
+            f"Dispatched: {results['dispatched']}, "
+            f"Skipped: {results['skipped']}, "
+            f"Stuck reset: {results['stuck_services_found']}"
+        )
+        LOGGER.info(summary)
 
-            await track_event("scheduler_timer_completed", results)
+        await track_event("scheduler_timer_completed", results)
 
-            # Only write master log if work was done
-            if results['successful'] > 0 or results['failed'] > 0 or results['dispatched'] > 0:
+        # --- Logging phase ---------------------------------------------------
+        # SQL Executor read-timeouts during master logging must NOT fail the
+        # invocation (issue #8 false symptom) and must NOT leave an orphan
+        # 'pending' row (issue #7). The two-step log_start (INSERT then query
+        # back log_id) can land the INSERT but time out on the query-back,
+        # leaving status='pending' with no log_id. Close it out by
+        # invocation_id and never re-raise — a logging failure is not a
+        # dispatch failure.
+        if results['successful'] > 0 or results['failed'] > 0 or results['dispatched'] > 0:
+            try:
                 await master_logger.log_start(
                     sql_client,
                     request_data=json.dumps({"is_past_due": timer.past_due}),
@@ -896,17 +911,29 @@ async def scheduler_timer(timer: func.TimerRequest) -> None:
                         sql_client,
                         response_data=json.dumps(results),
                     )
-            else:
-                LOGGER.info("No services triggered — skipping master log entry")
-
-        except Exception as e:
-            LOGGER.error(f"Scheduler timer failed: {e}")
-            try:
-                await master_logger.log_error(sql_client, str(e))
-            except Exception:
-                pass
-            await track_exception(e, {"operation": "scheduler_timer"})
-            raise
+            except Exception as e:
+                LOGGER.error(f"Scheduler master logging failed: {e}")
+                await track_exception(e, {"operation": "scheduler_timer_logging"})
+                # Best-effort: close the orphan 'pending' row left by a
+                # timed-out log_start. invocation_id is a generated uuid4
+                # (injection-safe); guard on status='pending' so this is a
+                # no-op if logging actually succeeded. ended_at is left to
+                # the status-change DB trigger, matching normal completion.
+                try:
+                    err_escaped = master_logger._escape_sql_string(str(e))
+                    await sql_client.execute(
+                        "UPDATE jgilpatrick.apps_master_services_log "
+                        "SET status = 'failed', "
+                        f"error_message = 'scheduler_timer logging timed out: {err_escaped}' "
+                        f"WHERE invocation_id = '{master_logger.invocation_id}' "
+                        "AND status = 'pending'",
+                        method="execute",
+                        title="Close orphan scheduler_timer pending row",
+                    )
+                except Exception as cleanup_err:
+                    LOGGER.error(f"Orphan pending cleanup failed: {cleanup_err}")
+        else:
+            LOGGER.info("No services triggered — skipping master log entry")
 
 
 @bp.route(route="scheduler/manual-trigger", methods=["POST"])
