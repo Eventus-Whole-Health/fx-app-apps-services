@@ -64,6 +64,11 @@ SET el.status            = 'success',
                               THEN DATEDIFF(SECOND, m.m_start, m.m_end) * 1000
                               ELSE el.duration_ms
                            END,
+    el.completed_at      = CASE
+                              WHEN m.m_end IS NOT NULL
+                              THEN m.m_end
+                              ELSE el.completed_at
+                           END,
     el.error_message     = NULL,
     el.response_detail   = 'Backfilled by migration 003 (#9): '
                          + 'master log terminal success'
