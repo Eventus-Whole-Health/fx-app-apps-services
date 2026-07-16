@@ -5,17 +5,91 @@ This module provides structured logging to SEQ for centralized log management.
 Following the standard configuration pattern from SEQ_AZURE_FUNCTIONS_SETUP.md
 """
 
+import json
 import logging
 import os
 import re
 from datetime import datetime
 from typing import Dict, Optional, Any
 from urllib.parse import urlparse
+
 import azure.functions as func
+import requests
 
 # Lazy import seqlog to avoid issues if not installed
 _seqlog_configured = False
 _seq_enabled = False
+
+# seqlog==0.4.3's SeqLogHandler.publish_log_batch holds the logging Handler's
+# lock (self.acquire()/self.release()) around an untimed requests.Session.post().
+# When Seq is unreachable, that POST can hang indefinitely while holding the
+# lock every other logging.*() call needs, freezing the whole process. Apply a
+# bounded timeout so a dead Seq degrades logging instead of wedging the app.
+_SEQ_REQUEST_TIMEOUT = (3.05, 10)
+
+
+def _patch_seqlog_request_timeout() -> None:
+    """Add a request timeout to seqlog's Seq POST to prevent an unbounded hang.
+
+    Best-effort: if seqlog's internals don't match what we patched against
+    (for example after a version bump), log a warning and leave seqlog's
+    default behavior in place rather than crashing startup.
+    """
+    try:
+        from seqlog import structured_logging as seqlog_structured_logging
+
+        def _patched_publish_log_batch(self, batch):
+            if len(batch) == 0:
+                return
+
+            processed_records = []
+            for record in batch:
+                response_payload = self._build_event_data(record)
+                try:
+                    response_payload = json.dumps(response_payload, cls=self.json_encoder_class)
+                except TypeError:
+                    self.handleError(record)
+                    continue
+                processed_records.append(response_payload)
+
+            request_body_json = '{"Events": [%s]}' % (','.join(processed_records),)
+
+            self.acquire()
+            try:
+                response = self.session.post(
+                    self.server_url,
+                    data=request_body_json,
+                    stream=True,
+                    timeout=_SEQ_REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+            except requests.RequestException as request_failed:
+                self.handleError(batch[0])
+
+                if not request_failed.response:
+                    seqlog_structured_logging._log_logger_error(
+                        'response from Seq was unavailable.',
+                        request_failed,
+                    )
+                elif not request_failed.response.text:
+                    seqlog_structured_logging._log_logger_error(
+                        'response body from Seq was empty.',
+                        request_failed,
+                    )
+                else:
+                    seqlog_structured_logging._log_logger_error(
+                        'response body from Seq:\\n\\n{0}'.format(request_failed.response.text),
+                        request_failed,
+                    )
+            finally:
+                self.release()
+
+        seqlog_structured_logging.SeqLogHandler.publish_log_batch = _patched_publish_log_batch
+
+    except Exception as exc:
+        logging.warning(
+            f"Could not patch seqlog request timeout - falling back to untimed POST: {exc}"
+        )
 
 
 class Emoticons:
@@ -185,6 +259,8 @@ def configure_seq_logging() -> bool:
 
     try:
         import seqlog
+
+        _patch_seqlog_request_timeout()
 
         # Configure SEQ logging with optimized settings
         seqlog.log_to_seq(
